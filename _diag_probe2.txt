@@ -1,0 +1,3 @@
+A: 　 (one backslash)
+B: \\u3000 (two backslashes)
+C: literal ideographic space next: 　 end
