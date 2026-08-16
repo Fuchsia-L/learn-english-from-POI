@@ -3,6 +3,9 @@
 用法:
     python -m app.ingest <srt文件> --title "Person of Interest" \\
         --season-ep s01e01 --video /path/ep.mp4 --db data/poi.db
+    # 顺带回填 extract_hardsub.py --boxes-json 产出的词级包围盒（播放器热区）
+    python -m app.ingest ep.en.srt --title ... --season-ep s01e01 \\
+        --boxes-json ep.boxes.json
 
 规则（验收标准 §6 ingest 行）:
 - token 统一小写归一；
@@ -12,6 +15,7 @@
 - 词元归一走 simplemma（DESIGN §7 默认选型），lemma 一律小写。
 
 幂等：同一 (title, season_ep) 重复 ingest 只更新不新增；srt 变短时清掉多余段。
+词框回填同样幂等（按 (content_id, idx) 覆盖写，不追加）。
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import argparse
 import json
 import re
 import sqlite3
+import sys
 import unicodedata
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -302,6 +307,104 @@ def ingest_cues(
     }
 
 
+# --- 词级包围盒回填（DESIGN §4 热区） --------------------------------------
+# 输入是 scripts/extract_hardsub.py --boxes-json 的产物：
+#   [{idx, start, end, text, words: [{w, x, y, width, height}]}]
+# idx 与 srt 序号（1 起）一一对应，即 Segment.idx。坐标是视频原始帧像素，
+# x=null 表示该词丢框（OCR 置信度过低）——丢框不丢词，前端跳过该词热区。
+# 这里只按 idx 认段、把 words 数组**原样**存进 Segment.word_boxes_json，
+# 不做坐标变换（前端按 video 实际显示尺寸缩放，见 static/player.html）。
+
+
+def _warn(msg: str) -> None:
+    print(f"[ingest] 警告: {msg}", file=sys.stderr)
+
+
+def load_boxes(path: str | Path) -> list:
+    """读 --boxes-json 文件。顶层必须是列表。"""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"boxes-json 顶层应为列表，实际是 {type(data).__name__}")
+    return data
+
+
+def _same_text(a: str | None, b: str | None) -> bool:
+    norm = lambda s: re.sub(r"\s+", " ", (s or "")).strip().lower()  # noqa: E731
+    return norm(a) == norm(b)
+
+
+def apply_boxes(
+    conn: sqlite3.Connection,
+    content_id: int,
+    entries: Iterable,
+    warn=_warn,
+) -> dict:
+    """把词框按 idx 回填到对应 Segment.word_boxes_json。
+
+    幂等：同一份 boxes 重复跑结果一致（覆盖写，不追加）。
+    对不上的 idx / 结构不合法的条目只告警不中断（OCR 产物与 srt 可能不同批次）。
+    """
+    known = {
+        int(r["idx"]): r["text_en"]
+        for r in conn.execute(
+            "SELECT idx, text_en FROM Segment WHERE content_id = ?", (content_id,)
+        )
+    }
+    applied = 0
+    skipped = 0
+    missing: list[int] = []
+    text_mismatch: list[int] = []
+    seen: set[int] = set()
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            skipped += 1
+            warn(f"boxes 条目不是对象，跳过: {entry!r:.60}")
+            continue
+        raw_idx = entry.get("idx")
+        try:
+            idx = int(raw_idx)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            skipped += 1
+            warn(f"boxes 条目缺少可用的 idx，跳过: {raw_idx!r}")
+            continue
+        words = entry.get("words")
+        if words is None:
+            words = []
+        if not isinstance(words, list):
+            skipped += 1
+            warn(f"idx={idx} 的 words 不是列表，跳过")
+            continue
+        if idx not in known:
+            missing.append(idx)
+            warn(f"idx={idx} 在 content_id={content_id} 里没有对应字幕段，跳过")
+            continue
+        if idx in seen:
+            warn(f"idx={idx} 在 boxes 里重复出现，后者覆盖前者")
+        if not _same_text(entry.get("text"), known[idx]):
+            text_mismatch.append(idx)
+            warn(f"idx={idx} 的 boxes.text 与库里 text_en 不一致（仍按 idx 回填）")
+        seen.add(idx)
+        conn.execute(
+            "UPDATE Segment SET word_boxes_json = ? WHERE content_id = ? AND idx = ?",
+            (json.dumps(words, ensure_ascii=False), content_id, idx),
+        )
+        applied += 1
+
+    uncovered = sorted(set(known) - seen)
+    if missing:
+        warn(f"共 {len(missing)} 个 idx 对不上字幕段: {missing[:10]}")
+    if uncovered:
+        warn(f"共 {len(uncovered)} 个字幕段没有词框（前端走自渲染退路）: {uncovered[:10]}")
+    return {
+        "boxes_applied": applied,
+        "boxes_skipped": skipped,
+        "boxes_missing_idx": missing,
+        "boxes_text_mismatch_idx": text_mismatch,
+        "segments_without_boxes": uncovered,
+    }
+
+
 def ingest_srt(
     db_path: str | Path,
     srt_path: str | Path,
@@ -309,9 +412,14 @@ def ingest_srt(
     season_ep: str,
     video_path: str | None = None,
     conn: sqlite3.Connection | None = None,
+    boxes_path: str | Path | None = None,
 ) -> dict:
-    """入口：解析 srt 并写库，返回统计 dict。"""
+    """入口：解析 srt 并写库，返回统计 dict。
+
+    给了 boxes_path 就在同一事务里回填词框（见 apply_boxes）。
+    """
     cues = parse_srt_file(srt_path)
+    entries = load_boxes(boxes_path) if boxes_path else None
     own_conn = conn is None
     conn = conn or init_db(db_path)
     try:
@@ -320,6 +428,8 @@ def ingest_srt(
                 conn, title, season_ep, video_path, str(srt_path)
             )
             stats = ingest_cues(conn, content_id, cues)
+            if entries is not None:
+                stats.update(apply_boxes(conn, content_id, entries))
         stats["content_id"] = content_id
         stats["title"] = title
         stats["season_ep"] = season_ep
@@ -339,6 +449,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--season-ep", required=True, help="集号，例：s01e01")
     ap.add_argument("--video", default=None, help="视频文件路径（/media 接口用）")
     ap.add_argument("--db", default="data/poi.db", help="SQLite 路径")
+    ap.add_argument(
+        "--boxes-json",
+        default=None,
+        help="extract_hardsub.py --boxes-json 的产物，按 idx 回填词级包围盒（播放器热区）",
+    )
     args = ap.parse_args(argv)
 
     stats = ingest_srt(
@@ -347,6 +462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         title=args.title,
         season_ep=args.season_ep,
         video_path=args.video,
+        boxes_path=args.boxes_json,
     )
     print(
         f"[ingest] {args.title} {args.season_ep} -> content_id={stats['content_id']}\n"
@@ -355,6 +471,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"  unique surfaces : {stats['unique_surfaces']}\n"
         f"  unique lemmas   : {stats['unique_lemmas']}"
     )
+    if args.boxes_json:
+        print(
+            f"  word boxes      : {stats['boxes_applied']} 段回填"
+            f"（跳过 {stats['boxes_skipped']}，对不上 idx {len(stats['boxes_missing_idx'])}，"
+            f"无框段 {len(stats['segments_without_boxes'])}）"
+        )
     return 0
 
 
