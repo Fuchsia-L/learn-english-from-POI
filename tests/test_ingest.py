@@ -138,3 +138,166 @@ def test_cli_main(db_path, srt_file, capsys):
     c = get_conn(db_path)
     assert c.execute("SELECT COUNT(*) c FROM Segment").fetchone()["c"] == 5
     c.close()
+
+
+# --- 词框回填 --boxes-json（DESIGN §4 热区） --------------------------------
+
+
+def fake_boxes(entries):
+    """自造 extract_hardsub --boxes-json 产物：[(idx, text, [(w, x)…])]。
+
+    坐标随手编，只要求形状与 README 契约一致（视频原始帧像素，x 可为 null）。
+    """
+    out = []
+    for idx, text, words in entries:
+        out.append(
+            {
+                "idx": idx,
+                "start": float(idx),
+                "end": float(idx) + 1.0,
+                "text": text,
+                "words": [
+                    {"w": w, "x": x, "y": 1030, "width": 20 * len(w), "height": 40}
+                    if x is not None
+                    else {"w": w, "x": None, "y": None, "width": None, "height": None}
+                    for w, x in words
+                ],
+            }
+        )
+    return out
+
+
+def boxes_file(tmp_path, payload, name="ep.boxes.json"):
+    p = tmp_path / name
+    p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def seg_boxes(conn, idx):
+    row = conn.execute(
+        "SELECT word_boxes_json FROM Segment WHERE idx = ?", (idx,)
+    ).fetchone()
+    return None if row["word_boxes_json"] is None else json.loads(row["word_boxes_json"])
+
+
+def test_boxes_json_backfills_words_verbatim(tmp_path, db_path, srt_file, conn):
+    payload = fake_boxes(
+        [
+            (1, "The tall gardener went home early.", [("The", 100), ("tall", 180)]),
+            (3, "My cousins bought two cameras; the cameras were cheap.", [("My", 90)]),
+        ]
+    )
+    stats = ingest_srt(
+        db_path,
+        srt_file,
+        "Fixture Show",
+        "s01e01",
+        conn=conn,
+        boxes_path=boxes_file(tmp_path, payload),
+    )
+    assert stats["boxes_applied"] == 2
+    assert stats["boxes_missing_idx"] == []
+    # words 数组原样入库（键名、顺序、坐标都不动）
+    assert seg_boxes(conn, 1) == payload[0]["words"]
+    assert seg_boxes(conn, 3) == payload[1]["words"]
+    # 没给框的段保持 NULL → 前端走自渲染退路
+    assert seg_boxes(conn, 2) is None
+    assert stats["segments_without_boxes"] == [2, 4, 5]
+
+
+def test_boxes_json_keeps_null_x_words(tmp_path, db_path, srt_file, conn):
+    payload = fake_boxes([(1, "The tall gardener went home early.",
+                          [("The", 100), ("tall", None), ("gardener", 260)])])
+    ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+               boxes_path=boxes_file(tmp_path, payload))
+    words = seg_boxes(conn, 1)
+    assert [w["w"] for w in words] == ["The", "tall", "gardener"]
+    assert words[1]["x"] is None  # 丢框不丢词
+
+
+def test_boxes_json_is_idempotent(tmp_path, db_path, srt_file, conn):
+    path = boxes_file(tmp_path, fake_boxes(
+        [(1, "The tall gardener went home early.", [("The", 100)])]))
+    first = ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+                       boxes_path=path)
+    snap = [dict(r) for r in conn.execute("SELECT * FROM Segment ORDER BY idx")]
+    second = ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+                        boxes_path=path)
+    assert first == second
+    assert [dict(r) for r in conn.execute("SELECT * FROM Segment ORDER BY idx")] == snap
+
+
+def test_boxes_json_unknown_idx_warns_without_aborting(tmp_path, db_path, srt_file, conn, capsys):
+    payload = fake_boxes(
+        [
+            (99, "Ghost cue that no segment matches.", [("Ghost", 10)]),
+            (2, "Marlow says it's raining again,\nand I don't believe her at all.",
+             [("Marlow", 120)]),
+        ]
+    )
+    stats = ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+                       boxes_path=boxes_file(tmp_path, payload))
+    assert stats["boxes_applied"] == 1
+    assert stats["boxes_missing_idx"] == [99]
+    assert seg_boxes(conn, 2) == payload[1]["words"]
+    err = capsys.readouterr().err
+    assert "idx=99" in err and "警告" in err
+
+
+def test_boxes_json_bad_entries_are_skipped(tmp_path, db_path, srt_file, conn, capsys):
+    payload = [
+        "not a dict",
+        {"idx": "abc", "words": []},
+        {"idx": 4, "words": "nope"},
+        {"idx": 5, "text": "\"Stop!\" she shouted -- nobody stopped.", "words": []},
+    ]
+    stats = ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+                       boxes_path=boxes_file(tmp_path, payload))
+    assert stats["boxes_skipped"] == 3
+    assert stats["boxes_applied"] == 1
+    assert seg_boxes(conn, 5) == []       # 空 words 也算回填（前端据此走退路）
+    assert seg_boxes(conn, 4) is None
+    assert "警告" in capsys.readouterr().err
+
+
+def test_boxes_json_text_mismatch_warns_but_applies(tmp_path, db_path, srt_file, conn, capsys):
+    payload = fake_boxes([(1, "Totally different sentence here.", [("Totally", 100)])])
+    stats = ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+                       boxes_path=boxes_file(tmp_path, payload))
+    assert stats["boxes_text_mismatch_idx"] == [1]
+    assert seg_boxes(conn, 1) == payload[0]["words"]
+    assert "text_en 不一致" in capsys.readouterr().err
+
+
+def test_reingest_without_boxes_keeps_existing(tmp_path, db_path, srt_file, conn):
+    payload = fake_boxes([(1, "The tall gardener went home early.", [("The", 100)])])
+    ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+               boxes_path=boxes_file(tmp_path, payload))
+    ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn)
+    assert seg_boxes(conn, 1) == payload[0]["words"]
+
+
+def test_boxes_json_rejects_non_list_toplevel(tmp_path, db_path, srt_file, conn):
+    import pytest
+
+    path = boxes_file(tmp_path, {"idx": 1})
+    with pytest.raises(ValueError):
+        ingest_srt(db_path, srt_file, "Fixture Show", "s01e01", conn=conn,
+                   boxes_path=path)
+
+
+def test_cli_main_with_boxes(tmp_path, db_path, srt_file, capsys):
+    path = boxes_file(tmp_path, fake_boxes(
+        [(1, "The tall gardener went home early.", [("The", 100), ("tall", 180)])]))
+    rc = main([str(srt_file), "--title", "Fixture Show", "--season-ep", "s01e01",
+               "--db", str(db_path), "--boxes-json", str(path)])
+    assert rc == 0
+    assert "word boxes      : 1 段回填" in capsys.readouterr().out
+    from app.db import get_conn
+
+    c = get_conn(db_path)
+    words = json.loads(
+        c.execute("SELECT word_boxes_json FROM Segment WHERE idx = 1").fetchone()[0]
+    )
+    assert [w["w"] for w in words] == ["The", "tall"]
+    c.close()
