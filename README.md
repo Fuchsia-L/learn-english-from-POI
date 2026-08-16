@@ -8,7 +8,7 @@
 - [x] 字幕解析 / 分词 / 词元归一 (`app/ingest.py` + `app/db.py`) — srt → SQLite，token 小写归一、simplemma 词元、不排专名
 - [x] 本地词典 (`scripts/build_ecdict.py`) — ECDICT 77 万词条 → `data/ecdict.db`（音标/中文释义/考试标签/词形变换）
 - [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 字幕三档 + OCR 词框热区 + 查询卡 + 生词本侧栏
-- [ ] AI 助记异步生成 (annotate)
+- [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
 - [ ] 生词本与复习
 
 核心原则:LLM 只产语义,代码管装配和钱;词元(lexeme)为主键,encounter 记录每次真实语境;按需生产,看到哪集造到哪集。
@@ -74,6 +74,71 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers playwright install chromium   # 首次
 pytest tests/test_player_e2e.py
 ```
+
+## annotate：助记 worker
+
+助记是**异步旁路**：收藏时只往 `AnnotationJob` 排个队，播放器该放放该点点；
+worker 单独跑，生成完写进 `Mnemonic`，前端轮询 `GET /mnemonic?lexeme_id=` 拿结果。
+LLM 永不阻塞播放（DESIGN §0）。
+
+```bash
+# 离线跑一轮：fake provider，确定性假内容，0 元、0 网络请求
+python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --once
+# 常驻跟队列
+python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --loop --poll 5
+# 先看要花多少钱、prompt 长什么样（不发请求）
+python -m app.annotate --db data/poi.db --provider deepseek --dry-run
+```
+
+**塞 key 即可切真 provider**——代码已经写完，缺的只是钱：
+
+```bash
+export DEEPSEEK_API_KEY=sk-...        # 或 ANTHROPIC_API_KEY=sk-ant-...
+python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
+    --provider deepseek --loop --budget 4.0
+```
+
+没设对应环境变量时，真 provider 在**发 HTTP 的那一刻**抛 `ProviderNotConfigured`
+（构造、拼 prompt、`estimate_cost` 全都照常工作，所以离线也能调提示词、估预算）。
+
+- **取任务口径**：`status='queued'`，`priority DESC, id ASC`。点击收藏 = priority 10
+  插队，预热 = priority 0。
+- **输入包**（一词一包，DESIGN §5）：lemma + ECDICT 音标/词性/释义 + 最近一条
+  Encounter 的原句/时间戳/集数；预热词没有 encounter 就退回"当集任一含该词的字幕原句"。
+- **输出**强制过 JSON schema（`app/providers/__init__.py` 的 `ANNOTATION_SCHEMA`），
+  不合规就重试，`--retries`（默认 2）次后该任务置 `failed`，不影响同批其他词。
+- **落库**：`context_gloss` 单独一行 `kind="gloss"`，每条 hook 按 `type` 拆行
+  （morph/pun/imagery/…），同一 lexeme 每次重生成 `version` 递增；
+  **`edited_by_user=1` 的 kind 永不被覆盖**（用户改过的那条就是最终版）。
+- **预算制**（DESIGN §5）：累计 `estimate_cost` 超 `--budget`（默认 ¥4）后，
+  低优先级任务一律不再送出、保持 `queued`（调高预算再跑就继续）；
+  高优先级（收藏的词）不受预算限制。
+- 免责标签由**代码**兜底，不指望模型自觉：`morph` 拆分永远标"未经词源核验"，
+  其余 hook 一律带"非词源"。没有事实区（DESIGN §5：`factual` 已处决）。
+- 单任务失败、provider 抛任何异常、落库出错都不会掀翻 worker。
+
+### 调提示词
+
+提示词全在 `app/providers/prompts.py` 一个文件里，改完跑 `pytest tests/test_providers.py`
+验契约还在。**音标（ipa）是显式喂进 prompt 的**——谐音钩子必须依据读音而不是拼写，
+这条写死在模板里。`python -m app.annotate --dry-run` 会打印真实输入包，
+`provider.dump_prompt(batch)` 打印完整 system + user prompt。
+
+价目表（人民币/百万 token）写在各 provider 类顶部的
+`price_in_cny_per_mtok` / `price_out_cny_per_mtok`，**随时可能过期，自己核对官网后改**。
+
+## prefetch：预热入队
+
+```bash
+python scripts/prefetch.py --db data/poi.db --content-id 1 \
+    --wordlist data/cet46.txt --limit 200
+python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --once --budget 4.0
+```
+
+当集 lemma ∩ 词表 → 按 wordfreq 词频降序 → 低优先级（0）入队；已 queued/running/done
+的词跳过（失败过的允许重排），重复跑幂等。`data/cet46.txt` 不存在时会打印生成方法
+（从 `data/ecdict.db` 的 `tag` 字段一条命令导出 CET4/6 词表）并以非零码退出。
+`--dry-run` 只算不写。
 
 ## extract_hardsub.py
 

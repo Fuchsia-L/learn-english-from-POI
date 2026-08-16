@@ -13,11 +13,14 @@ pydantic==2.13.3
 # 硬字幕 OCR（scripts/extract_hardsub.py，另需系统装 ffmpeg + tesseract-ocr[eng]）
 pillow==12.2.0
 numpy==2.4.4
-wordfreq==3.1.1
+wordfreq==3.1.1        # 也用于 scripts/prefetch.py 的词频排序（离线词表，不联网）
+
+# 助记 worker（app/annotate.py + app/providers/，M1）
+jsonschema==4.26.0     # DESIGN §5 输出契约校验（缺席时退回等价手写校验）
+httpx==0.28.1          # 真 provider 发 HTTP + fastapi.testclient 依赖
 
 # 测试
 pytest==9.1.1
-httpx==0.28.1          # fastapi.testclient 依赖（tests/test_server.py）
 # 播放器 E2E（tests/test_player_e2e.py，标记 slow）。浏览器二进制不在 pip 里：
 #   PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers playwright install chromium
 playwright==1.56.0
