@@ -45,9 +45,17 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 pip install pillow numpy wordfreq
 # 另需 ffmpeg 和 tesseract-ocr (eng)
 python scripts/extract_hardsub.py episode.mp4 -o episode.en.srt
+# 顺带导出词级包围盒(播放器透明点击热区,DESIGN §4)
+python scripts/extract_hardsub.py episode.mp4 -o episode.en.srt \
+    --boxes-json episode.boxes.json
 ```
 
 默认 `--crop 1920:54:0:1026` 对准 bilibili 正版 POI 1080p 双语硬字幕的英文行;其他片源截一帧带字幕的画面调整 W:H:X:Y 即可。
+
+`--boxes-json` 输出 `[{idx, start, end, text, words:[{w, x, y, width, height}]}]`:
+`idx` 与 srt 序号(1 起)一一对应,`w` 是清洗后的词(标点随词),坐标为**视频原始帧**整数像素
+(已还原 2x 放大并加回 crop 偏移)。tesseract 置信度过低或框异常时该词 `x=null`
+——丢框不丢词,前端跳过该词热区。加不加 `--boxes-json`,srt 输出逐字节一致。
 
 流程:ffmpeg 按 3fps 裁剪采样英文字幕带 → 掩码 IoU 合并同句连续帧 → 每段取一帧跑 tesseract → 确定性清洗(| → I 等)+ 垃圾过滤(街灯/监控画面渗入误检)→ 输出带时间戳的 srt。
 
