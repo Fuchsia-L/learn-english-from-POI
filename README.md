@@ -27,6 +27,18 @@ pytest                                   # 全部夹具为自造句子，不含�
 （`[{surface, lemma, char_start, char_end}]`，char 偏移相对 `text_en`）存在
 `Segment.tokens_json`，供 `GET /segments` 直接吐给前端渲染点击热区。
 
+## server：本地服务
+
+```bash
+POI_DB=data/poi.db POI_ECDICT=data/ecdict.db uvicorn app.server:app --port 8000
+python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # 等价 CLI
+```
+
+端点见 DESIGN §3：`/episodes`、`/media/{content_id}`（HTTP Range，拖进度条用）、
+`/segments?content_id=`、`/lookup?surface=&segment_id=`、`POST /collect`、`/vocab`、
+`/mnemonic?lexeme_id=`；`/` 重定向到 `/static/player.html`。全程本地 SQLite，无网络调用；
+`data/ecdict.db` 缺失时 `/lookup` 降级为 `in_dict=false` 而不报错。
+
 ## extract_hardsub.py
 
 ```bash
