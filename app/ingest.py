@@ -40,11 +40,9 @@ _TIME_RE = re.compile(
     r"(?P<eh>\d{1,3}):(?P<em>\d{1,2}):(?P<es>\d{1,2})[,.](?P<ems>\d{1,3})"
 )
 
-# token：以字母开头结尾，内部允许撑号/连字符（it's、don't、ex-con）。
-# [^\W\d_] = unicode 字母（含 café 这类重音字符），排除数字和下划线。
+A_MARK = 1
 _TOKEN_RE = re.compile(r"[^\W\d_]+(?:['’ʼ\-][^\W\d_]+)*", re.UNICODE)
 
-# 字幕里常见的非台词标记：</i>…</i>、{\an8} 之类
 _TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>|\{[^}]*\}")
 
 
@@ -129,20 +127,14 @@ def _clean_line(line: str) -> str:
     return re.sub(r"[ \t]+", " ", line).strip()
 
 
-# --- 分词 / 词元归一 -------------------------------------------------------
-
-
 def normalize_surface(raw: str) -> str:
     """token 统一小写归一：小写 + 撑号变体统一成 ASCII '。"""
     s = unicodedata.normalize("NFC", raw).lower()
     return s.replace("’", "'").replace("ʼ", "'")
 
 
-# 缩合形的确定性前置规则（simplemma 在这类词上不可靠：it's→its、i'm→i'm）。
-# 只处理英语固定的一小撑 clitic，其余一律交给 simplemma。
-_CLITICS = frozenset({"s", "re", "ve", "ll", "d", "m"})  # it's / we're / they've / he'll / i'd / i'm
-_NT_BASES = {"ca": "can", "wo": "will", "sha": "shall", "ai": "be"}  # can't / won't / shan't / ain't
-# 情态动词各自成词元（simplemma 会把 should 归到 shall、might 归到 may）
+_CLITICS = frozenset({"s", "re", "ve", "ll", "d", "m"})
+_NT_BASES = {"ca": "can", "wo": "will", "sha": "shall", "ai": "be"}
 _MODALS = frozenset(
     {"should", "would", "could", "might", "must", "can", "will", "shall", "may", "ought"}
 )
@@ -157,18 +149,16 @@ def lemmatize(surface: str) -> str:
         return surface
     if surface in _MODALS:
         return surface
-    # don't → do、shouldn't → should、won't → will
     if surface.endswith("n't") and len(surface) > 3:
         base = surface[:-3]
         return _NT_BASES.get(base) or lemmatize(base)
-    # it's → it、i'm → i、they've → they、cousin's → cousin
     if "'" in surface:
         stem, _, clitic = surface.rpartition("'")
         if stem and clitic in _CLITICS:
             return lemmatize(stem)
     try:
         lemma = simplemma.lemmatize(surface, lang=LANG)
-    except Exception:  # simplemma 对怪字符可能抛，退回原形
+    except Exception:
         lemma = surface
     lemma = normalize_surface(lemma or surface)
     return lemma or surface
@@ -200,9 +190,6 @@ def tokenize(text: str) -> list[Token]:
 
 def tokens_to_json(tokens: Sequence[Token]) -> str:
     return json.dumps([asdict(t) for t in tokens], ensure_ascii=False)
-
-
-# --- 入库 ------------------------------------------------------------------
 
 
 def upsert_content(
@@ -278,7 +265,6 @@ def ingest_cues(
         for tok in tokens:
             surface_to_lemma[tok.surface] = tok.lemma
 
-    # srt 变短时清掉上一次留下的多余段
     if kept_idx:
         placeholders = ",".join("?" * len(kept_idx))
         conn.execute(
@@ -288,7 +274,6 @@ def ingest_cues(
     else:
         conn.execute("DELETE FROM Segment WHERE content_id = ?", (content_id,))
 
-    # 词表：先建 lexeme 再挂 surface（不排专名）
     lemmas = sorted(set(surface_to_lemma.values()))
     lemma_ids = {lemma: get_or_create_lexeme(conn, lemma) for lemma in lemmas}
     for surface in sorted(surface_to_lemma):
