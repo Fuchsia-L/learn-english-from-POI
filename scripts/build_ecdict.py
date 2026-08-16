@@ -76,7 +76,7 @@ ask|ɑːsk|v. 问；请求|v.|zk|5
 back|bæk|n. 背部；adv. 向后|n.|zk|5
 bad|bæd|adj. 坏的；糟糕的|adj.|zk|5
 be|biː|v. 是；存在|v.|zk|5
-begin|bɪˈgɪn|v. 开始|v.|zk|4
+begin|bɪˈɡɪn|v. 开始|v.|zk|4
 book|bʊk|n. 书；v. 预订|n.|zk|5
 call|kɔːl|v. 呼叫；打电话|v.|zk|5
 car|kɑː|n. 汽车|n.|zk|5
@@ -98,10 +98,10 @@ family|ˈfæməli|n. 家庭|n.|zk|5
 find|faɪnd|v. 找到|v.|zk|5
 foodie|ˈfuːdi|n. 美食爱好者|n.||1
 friend|frend|n. 朋友|n.|zk|5
-get|get|v. 得到；变得|v.|zk|5
-give|gɪv|v. 给|v.|zk|5
-go|gəʊ|v. 去|v.|zk|5
-good|gʊd|adj. 好的|adj.|zk|5
+get|ɡet|v. 得到；变得|v.|zk|5
+give|ɡɪv|v. 给|v.|zk|5
+go|ɡəʊ|v. 去|v.|zk|5
+good|ɡʊd|adj. 好的|adj.|zk|5
 hand|hænd|n. 手|n.|zk|5
 happy|ˈhæpi|adj. 高兴的|adj.|zk|5
 have|hæv|v. 有|v.|zk|5
@@ -129,7 +129,7 @@ lot|lɒt|n. 许多；一块地|n.|zk|4
 love|lʌv|v. 爱；n. 爱情|v.|zk|5
 make|meɪk|v. 制作；使得|v.|zk|5
 man|mæn|n. 男人|n.|zk|5
-mean|miːn|v. 意味着；adj. 吝嚕的|v.|zk|5
+mean|miːn|v. 意味着；adj. 吝啬的|v.|zk|5
 mind|maɪnd|n. 思想；v. 介意|n.|zk|4
 name|neɪm|n. 名字|n.|zk|5
 new|njuː|adj. 新的|adj.|zk|5
@@ -165,7 +165,7 @@ water|ˈwɔːtə|n. 水|n.|zk|5
 way|weɪ|n. 方式；路|n.|zk|5
 week|wiːk|n. 周|n.|zk|5
 wife|waɪf|n. 妻子|n.|zk|4
-word|wɜd|n. 单词|n.|zk|5
+word|wɜːd|n. 单词|n.|zk|5
 work|wɜːk|n. 工作；v. 工作|n.|zk|5
 """
 
