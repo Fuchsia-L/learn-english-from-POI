@@ -1,0 +1,631 @@
+"""异步助记 worker：AnnotationJob 队列 → provider → Mnemonic（DESIGN.md §5）。
+
+用法::
+
+    # 离线跑一轮（默认 provider=fake，0 元）
+    python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --once
+    # 常驻跟队列，每集预算 ¥4（DESIGN §5 预热预算制）
+    python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
+        --provider deepseek --loop --budget 4.0
+    # 只看要花多少钱、prompt 长什么样，不发请求
+    python -m app.annotate --db data/poi.db --provider deepseek --dry-run
+
+流程（一批一批来）:
+1. 取 queued 任务，**priority DESC, id ASC**（收藏 priority=10 插队，预热=0）；
+2. 组装输入包：lemma + ECDICT 音标/释义 + 最近一条 Encounter 的原句/时间戳/集数；
+   预热词没有 encounter，退回"当集任一含该词的 Segment 原句"；
+3. 按批调 provider.annotate()，输出逐条过 JSON schema；
+4. 写 Mnemonic：context_gloss 单独一行 kind="gloss"，每个 hook 按 type 拆行存；
+   version 递增；**edited_by_user=1 的那个 kind 永不覆盖**；
+5. job 置 done / failed（重试 --retries 次后仍失败才置 failed）。
+
+预算制：累计 estimate_cost 超 --budget 后，低优先级（priority < 10）任务一律
+不再送出（保持 queued，下次调高预算再跑），高优先级不受预算限制。
+
+健壮性：单个任务/单个批次炸掉只影响它自己，worker 不崩；provider 抛什么异常都接。
+本模块除 provider 外不发任何网络请求（provider=fake 时全程零网络）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+from app.db import get_conn, init_db
+from app.providers import (
+    Provider,
+    ProviderNotConfigured,
+    SchemaViolation,
+    enforce_labels,
+    get_provider,
+    validate_annotation,
+)
+
+# ECDICT 查询口径（word_lower + 优先本身小写那条）与 pos/释义取法只有一份实现，
+# 放在 server 里；worker 直接复用，免得两处口径漂移。
+from app.server import COLLECT_JOB_PRIORITY, EcdictStore, _fill_from_ecdict
+
+DEFAULT_DB = "data/poi.db"
+DEFAULT_ECDICT = "data/ecdict.db"
+DEFAULT_BUDGET = 4.0  # 元 / 每次 worker 运行（DESIGN §5：每集默认上限 ¥4）
+DEFAULT_BATCH = 4
+DEFAULT_RETRIES = 2  # 失败重试 2 次后置 failed
+DEFAULT_POLL = 5.0
+
+# priority >= 这个值算高优先级（= 用户点击收藏），不受预算限制
+HIGH_PRIORITY = COLLECT_JOB_PRIORITY
+
+GLOSS_KIND = "gloss"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@dataclass
+class Job:
+    """一条待处理任务 + 它的输入包。"""
+
+    id: int
+    lexeme_id: int
+    priority: int
+    lemma: str
+    pack: dict = field(default_factory=dict)
+
+    @property
+    def high(self) -> bool:
+        return self.priority >= HIGH_PRIORITY
+
+
+@dataclass
+class RunStats:
+    picked: int = 0
+    done: int = 0
+    failed: int = 0
+    skipped_budget: int = 0
+    batches: int = 0
+    calls: int = 0
+    rows: int = 0
+    spent: float = 0.0
+
+    def as_dict(self) -> dict:
+        d = self.__dict__.copy()
+        d["spent"] = round(self.spent, 4)
+        return d
+
+
+class AnnotateWorker:
+    """队列驱动的助记生成器。单进程单连接，不做并发（SQLite 单写者足够）。"""
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        provider: Provider,
+        ecdict_path: str | Path | None = None,
+        budget: float = DEFAULT_BUDGET,
+        batch_size: int = DEFAULT_BATCH,
+        retries: int = DEFAULT_RETRIES,
+        limit: int | None = None,
+        content_id: int | None = None,
+        log: Callable[[str], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.provider = provider
+        self.provider_name = getattr(provider, "name", provider.__class__.__name__)
+        self.ecdict = EcdictStore(ecdict_path or DEFAULT_ECDICT)
+        self.budget = float(budget)
+        self.batch_size = max(1, int(batch_size))
+        self.retries = max(0, int(retries))
+        self.limit = limit
+        self.content_id = content_id
+        self.spent = 0.0  # 本次运行累计预估花费（元）
+        self._budget_logged = False
+        self._log = log if log is not None else self._default_log
+        self._sleep = sleep
+        self._conn: sqlite3.Connection | None = None
+
+    # --- 基础设施 ----------------------------------------------------------
+
+    @staticmethod
+    def _default_log(msg: str) -> None:
+        print(f"[annotate] {msg}", flush=True)
+
+    def log(self, msg: str) -> None:
+        try:
+            self._log(msg)
+        except Exception:  # 日志失败绝不影响主流程
+            pass
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            init_db(self.db_path).close()  # 幂等建表
+            self._conn = get_conn(self.db_path)
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self) -> "AnnotateWorker":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    # --- 取任务 ------------------------------------------------------------
+
+    def reset_stale_running(self) -> int:
+        """上次被 Ctrl-C 掐死留下的 running 任务放回队列（单机单 worker 假设）。"""
+        with self.conn as c:
+            cur = c.execute(
+                "UPDATE AnnotationJob SET status = 'queued' WHERE status = 'running'"
+            )
+        n = cur.rowcount or 0
+        if n:
+            self.log(f"重置 {n} 个僵死 running 任务 → queued")
+        return n
+
+    def queued_jobs(self, limit: int | None = None) -> list[Job]:
+        """DESIGN §5 的取任务口径：queued，priority DESC，id ASC。"""
+        sql = (
+            "SELECT J.id, J.lexeme_id, J.priority, L.lemma FROM AnnotationJob J "
+            "JOIN Lexeme L ON L.id = J.lexeme_id "
+            "WHERE J.status = 'queued' ORDER BY J.priority DESC, J.id ASC"
+        )
+        params: list[Any] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [
+            Job(
+                id=int(r["id"]),
+                lexeme_id=int(r["lexeme_id"]),
+                priority=int(r["priority"]),
+                lemma=r["lemma"],
+            )
+            for r in self.conn.execute(sql, params).fetchall()
+        ]
+
+    # --- 组装输入包（DESIGN §5 输入形状） ----------------------------------
+
+    def _latest_encounter(self, lexeme_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT E.surface, S.text_en, S.t_start, C.season_ep, C.id AS content_id "
+            "FROM Encounter E "
+            "JOIN VocabEntry V ON V.id = E.vocab_entry_id "
+            "JOIN Segment S ON S.id = E.segment_id "
+            "JOIN Content C ON C.id = S.content_id "
+            "WHERE V.lexeme_id = ? ORDER BY E.id DESC LIMIT 1",
+            (lexeme_id,),
+        ).fetchone()
+
+    def _any_segment_with(self, lemma: str) -> sqlite3.Row | None:
+        """预热词没有 encounter：拿当集任一含该词的字幕段当原句。
+
+        匹配的是 ingest 写进 Segment.tokens_json 的 `"lemma": "xxx"` 片段
+        （json.dumps 默认分隔符，形状稳定），不做整句正则。
+        """
+        sql = (
+            "SELECT S.text_en, S.t_start, C.season_ep, C.id AS content_id "
+            "FROM Segment S JOIN Content C ON C.id = S.content_id "
+            "WHERE S.tokens_json LIKE ? ESCAPE '\\'"
+        )
+        params: list[Any] = ['%"lemma": "' + _like_escape(lemma) + '"%']
+        if self.content_id is not None:
+            sql += " AND S.content_id = ?"
+            params.append(self.content_id)
+        sql += " ORDER BY S.content_id, S.idx LIMIT 1"
+        return self.conn.execute(sql, params).fetchone()
+
+    def build_pack(self, job: Job) -> dict:
+        """一词一包。缺字段就是 None——provider 侧要能吃下 None。"""
+        lex = self.conn.execute(
+            "SELECT id, lemma, pos, ipa, dict_gloss FROM Lexeme WHERE id = ?",
+            (job.lexeme_id,),
+        ).fetchone()
+        if lex is None:
+            raise LookupError(f"lexeme {job.lexeme_id} 不存在")
+        lemma = lex["lemma"]
+        # ECDICT 回填（顺手把 Lexeme 缓存补齐，生词本立刻能显示释义）
+        fields, _in_dict = _fill_from_ecdict(self.conn, self.ecdict, lex, lemma, lemma)
+
+        enc = self._latest_encounter(job.lexeme_id)
+        if enc is not None:
+            surface, sentence = enc["surface"], enc["text_en"]
+            t, episode = enc["t_start"], enc["season_ep"]
+        else:
+            seg = self._any_segment_with(lemma)
+            surface = lemma
+            sentence = seg["text_en"] if seg is not None else None
+            t = seg["t_start"] if seg is not None else None
+            episode = seg["season_ep"] if seg is not None else None
+            if seg is None:
+                self.log(f"lemma={lemma!r} 既无 encounter 也无字幕原句，裸词送模型")
+
+        return {
+            "lemma": lemma,
+            "surface": surface or lemma,
+            "pos": fields["pos"],
+            "ipa": fields["ipa"],
+            "dict_gloss": fields["dict_gloss"],
+            "sentence": sentence,
+            "speaker": None,  # OCR 拿不到可靠说话人（DESIGN §5）
+            "episode": episode,
+            "t": round(float(t), 3) if t is not None else None,
+        }
+
+    # --- 写 Mnemonic -------------------------------------------------------
+
+    def _protected_kinds(self, lexeme_id: int) -> set[str]:
+        """最新版本被用户编辑过的 kind：这些行永不被新一代覆盖（DESIGN §5）。"""
+        rows = self.conn.execute(
+            "SELECT kind, version, edited_by_user FROM Mnemonic WHERE lexeme_id = ? "
+            "ORDER BY kind, version DESC",
+            (lexeme_id,),
+        ).fetchall()
+        protected: set[str] = set()
+        seen: set[str] = set()
+        for r in rows:
+            if r["kind"] in seen:
+                continue
+            seen.add(r["kind"])
+            if int(r["edited_by_user"]):
+                protected.add(r["kind"])
+        return protected
+
+    def _next_version(self, lexeme_id: int) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM Mnemonic WHERE lexeme_id = ?",
+            (lexeme_id,),
+        ).fetchone()
+        return int(row["v"]) + 1
+
+    @staticmethod
+    def to_rows(out: dict) -> list[tuple[str, dict]]:
+        """输出包 → [(kind, payload)]。
+
+        context_gloss 单独一行 kind="gloss"；每个 hook 按 type 拆行。
+        同一 type 出现多条时后面的加 "#2" 后缀——(lexeme, kind, version) 是唯一键，
+        不加后缀会撞车丢内容。
+        """
+        rows: list[tuple[str, dict]] = [
+            (GLOSS_KIND, {"text": out["context_gloss"]})
+        ]
+        seen: dict[str, int] = {}
+        for hook in out.get("hooks", []):
+            t = hook.get("type") or "hook"
+            seen[t] = seen.get(t, 0) + 1
+            kind = t if seen[t] == 1 else f"{t}#{seen[t]}"
+            rows.append((kind, dict(hook)))
+        return rows
+
+    def write_result(self, job: Job, out: dict) -> int:
+        """落库，返回真正写进去的行数。被保护的 kind 会被跳过。"""
+        protected = self._protected_kinds(job.lexeme_id)
+        version = self._next_version(job.lexeme_id)
+        written = 0
+        with self.conn as c:
+            for kind, payload in self.to_rows(out):
+                if kind in protected:
+                    self.log(
+                        f"lemma={job.lemma!r} kind={kind} 已被用户编辑，跳过覆盖"
+                    )
+                    continue
+                c.execute(
+                    "INSERT INTO Mnemonic "
+                    "(lexeme_id, kind, payload_json, provider, version, edited_by_user) "
+                    "VALUES (?,?,?,?,?,0)",
+                    (
+                        job.lexeme_id,
+                        kind,
+                        json.dumps(payload, ensure_ascii=False),
+                        self.provider_name,
+                        version,
+                    ),
+                )
+                written += 1
+        return written
+
+    def _set_status(self, job_ids: Sequence[int], status: str) -> None:
+        if not job_ids:
+            return
+        marks = ",".join("?" * len(job_ids))
+        done_at = _now() if status in ("done", "failed") else None
+        try:
+            with self.conn as c:
+                c.execute(
+                    f"UPDATE AnnotationJob SET status = ?, done_at = ? "
+                    f"WHERE id IN ({marks})",
+                    [status, done_at, *job_ids],
+                )
+        except sqlite3.Error as exc:  # 落库失败也不许炸 worker
+            self.log(f"更新任务状态失败({status}): {exc}")
+
+    # --- 跑一批 ------------------------------------------------------------
+
+    def process_batch(self, batch: list[Job], stats: RunStats) -> None:
+        """一批的完整生命周期：running → 调用（含重试）→ 落库 → done/failed。"""
+        if not batch:
+            return
+        stats.batches += 1
+        self._set_status([j.id for j in batch], "running")
+
+        pending = list(batch)
+        results: dict[int, dict] = {}
+        last_err = ""
+        for attempt in range(self.retries + 1):
+            if not pending:
+                break
+            if attempt:
+                self.log(
+                    f"重试第 {attempt}/{self.retries} 次："
+                    f"{[j.lemma for j in pending]}（上次: {last_err[:120]}）"
+                )
+            try:
+                stats.calls += 1
+                outs = self.provider.annotate([dict(j.pack) for j in pending])
+            except ProviderNotConfigured as exc:
+                # 缺 key 重试一万次也没用，直接判死并把话说清楚
+                last_err = str(exc)
+                self.log(f"provider 未配置：{exc}")
+                break
+            except Exception as exc:  # provider 想抛什么抛什么，worker 不倒
+                last_err = f"{type(exc).__name__}: {exc}"
+                self.log(f"provider 调用失败：{last_err}")
+                continue
+            if not isinstance(outs, list) or len(outs) != len(pending):
+                last_err = f"输出条数 {len(outs) if isinstance(outs, list) else '?'} != {len(pending)}"
+                self.log(f"provider 输出条数不符：{last_err}")
+                continue
+            still: list[Job] = []
+            for job, out in zip(pending, outs):
+                try:
+                    results[job.id] = enforce_labels(validate_annotation(out))
+                except SchemaViolation as exc:
+                    last_err = f"schema: {exc}"
+                    self.log(f"lemma={job.lemma!r} 输出不合 schema：{exc}")
+                    still.append(job)
+            pending = still
+
+        ok_ids: list[int] = []
+        for job in batch:
+            out = results.get(job.id)
+            if out is None:
+                continue
+            try:
+                n = self.write_result(job, out)
+            except Exception as exc:  # 单条落库失败只算这条失败
+                self.log(f"lemma={job.lemma!r} 落库失败：{type(exc).__name__}: {exc}")
+                continue
+            stats.rows += n
+            ok_ids.append(job.id)
+            self.log(f"lemma={job.lemma!r} -> done（{n} 行，version 见库）")
+
+        failed = [j for j in batch if j.id not in ok_ids]
+        self._set_status(ok_ids, "done")
+        self._set_status([j.id for j in failed], "failed")
+        stats.done += len(ok_ids)
+        stats.failed += len(failed)
+        for j in failed:
+            self.log(f"lemma={j.lemma!r} -> failed（{last_err[:160] or '未知原因'}）")
+
+    # --- 跑一轮 ------------------------------------------------------------
+
+    def _prepare(self, jobs: list[Job], stats: RunStats) -> list[Job]:
+        """给任务装上输入包；装不上的直接判 failed（不占批次）。"""
+        ready: list[Job] = []
+        for job in jobs:
+            try:
+                job.pack = self.build_pack(job)
+            except Exception as exc:
+                self.log(f"job {job.id} 组包失败：{type(exc).__name__}: {exc}")
+                self._set_status([job.id], "failed")
+                stats.failed += 1
+                continue
+            ready.append(job)
+        return ready
+
+    def _estimate(self, batch: list[Job]) -> float:
+        try:
+            return float(self.provider.estimate_cost([dict(j.pack) for j in batch]))
+        except Exception as exc:
+            self.log(f"估价失败（按 0 处理）：{type(exc).__name__}: {exc}")
+            return 0.0
+
+    def run_once(self) -> RunStats:
+        """处理当前队列里能处理的全部任务，返回统计。不抛异常。"""
+        stats = RunStats()
+        try:
+            jobs = self.queued_jobs(self.limit)
+        except sqlite3.Error as exc:
+            self.log(f"读队列失败：{exc}")
+            return stats
+        if not jobs:
+            return stats
+        stats.picked = len(jobs)
+
+        high = self._prepare([j for j in jobs if j.high], stats)
+        low = self._prepare([j for j in jobs if not j.high], stats)
+
+        # 高优先级（用户点击收藏的词）不受预算限制，永远先跑
+        for i in range(0, len(high), self.batch_size):
+            batch = high[i : i + self.batch_size]
+            self.spent += self._estimate(batch)
+            stats.spent = self.spent
+            self.process_batch(batch, stats)
+
+        # 低优先级（预热）按预算截断
+        for i in range(0, len(low), self.batch_size):
+            batch = low[i : i + self.batch_size]
+            est = self._estimate(batch)
+            if self.spent + est > self.budget:
+                remaining = len(low) - i
+                stats.skipped_budget += remaining
+                if not self._budget_logged:
+                    self.log(
+                        f"预算已用尽（累计 ¥{self.spent:.4f} + 本批 ¥{est:.4f} "
+                        f"> 上限 ¥{self.budget:.2f}）：跳过 {remaining} 个低优先级任务"
+                        f"（保持 queued，调高 --budget 后可继续）"
+                    )
+                    self._budget_logged = True
+                break
+            self.spent += est
+            stats.spent = self.spent
+            self.process_batch(batch, stats)
+
+        stats.spent = self.spent
+        return stats
+
+    def run_loop(self, poll: float = DEFAULT_POLL, max_rounds: int | None = None) -> RunStats:
+        """常驻跟队列。Ctrl-C 干净退出；空转就睡 poll 秒。"""
+        total = RunStats()
+        rounds = 0
+        try:
+            while max_rounds is None or rounds < max_rounds:
+                rounds += 1
+                s = self.run_once()
+                total.picked += s.picked
+                total.done += s.done
+                total.failed += s.failed
+                total.skipped_budget += s.skipped_budget
+                total.batches += s.batches
+                total.calls += s.calls
+                total.rows += s.rows
+                total.spent = self.spent
+                if s.done == 0 and s.failed == 0:
+                    self._sleep(poll)
+        except KeyboardInterrupt:
+            self.log("收到 Ctrl-C，退出")
+        return total
+
+    # --- dry-run -----------------------------------------------------------
+
+    def dry_run(self) -> dict:
+        """只组包 + 估价，不调 provider、不写库、不改任务状态。"""
+        jobs = self._prepare_dry(self.queued_jobs(self.limit))
+        est = self._estimate(jobs) if jobs else 0.0
+        return {
+            "jobs": len(jobs),
+            "estimate_cny": round(est, 4),
+            "budget": self.budget,
+            "over_budget": est > self.budget,
+            "packs": [j.pack for j in jobs],
+        }
+
+    def _prepare_dry(self, jobs: list[Job]) -> list[Job]:
+        out = []
+        for job in jobs:
+            try:
+                job.pack = self.build_pack(job)
+            except Exception as exc:
+                self.log(f"job {job.id} 组包失败：{exc}")
+                continue
+            out.append(job)
+        return out
+
+
+# --- CLI -------------------------------------------------------------------
+
+
+def build_provider(name: str, model: str | None = None) -> Provider:
+    """按名造 provider。真 provider 的内部重试关掉——重试策略统一归 worker，
+    否则 worker 重试 × provider 重试 = 9 次调用，钱包受不了。"""
+    kwargs: dict[str, Any] = {}
+    if model:
+        kwargs["model"] = model
+    if name != "fake":
+        kwargs["retries"] = 0
+    try:
+        return get_provider(name, **kwargs)
+    except TypeError:  # 自定义 provider 不认这些参数
+        return get_provider(name)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="python -m app.annotate",
+        description="助记生成 worker（AnnotationJob 队列驱动，DESIGN §5）",
+    )
+    ap.add_argument("--db", default=os.environ.get("POI_DB", DEFAULT_DB))
+    ap.add_argument("--ecdict", default=os.environ.get("POI_ECDICT", DEFAULT_ECDICT))
+    ap.add_argument("--provider", default="fake", help="fake / anthropic / deepseek")
+    ap.add_argument("--model", default=None, help="覆盖 provider 默认模型")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="跑一轮就退出（默认）")
+    mode.add_argument("--loop", action="store_true", help="常驻跟队列")
+    ap.add_argument("--budget", type=float, default=DEFAULT_BUDGET,
+                    help=f"低优先级任务的累计预算上限，人民币元（默认 {DEFAULT_BUDGET}）")
+    ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
+    ap.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                    help=f"单批失败重试次数（默认 {DEFAULT_RETRIES}，超了置 failed）")
+    ap.add_argument("--limit", type=int, default=None, help="本轮最多取多少任务")
+    ap.add_argument("--content-id", type=int, default=None,
+                    help="预热词找原句时限定在这一集里找")
+    ap.add_argument("--poll", type=float, default=DEFAULT_POLL, help="--loop 空转睡多久")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只组包 + 估价，不调 provider、不写库")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args(argv)
+
+    try:
+        provider = build_provider(args.provider, args.model)
+    except Exception as exc:
+        print(f"[annotate] provider 初始化失败：{exc}")
+        return 2
+
+    log = (lambda _m: None) if args.quiet else None
+    worker = AnnotateWorker(
+        db_path=args.db,
+        provider=provider,
+        ecdict_path=args.ecdict,
+        budget=args.budget,
+        batch_size=args.batch_size,
+        retries=args.retries,
+        limit=args.limit,
+        content_id=args.content_id,
+        log=log,
+    )
+    with worker:
+        if not args.quiet:
+            print(
+                f"[annotate] db={args.db} provider={worker.provider_name} "
+                f"budget=¥{args.budget:.2f} batch={args.batch_size}"
+            )
+        if args.dry_run:
+            info = worker.dry_run()
+            print(
+                f"[annotate] dry-run: {info['jobs']} 个任务，预估 ¥{info['estimate_cny']}"
+                f"（预算 ¥{info['budget']:.2f}）"
+            )
+            for pack in info["packs"][:10]:
+                print("  " + json.dumps(pack, ensure_ascii=False))
+            return 0
+
+        worker.reset_stale_running()
+        stats = worker.run_loop(poll=args.poll) if args.loop else worker.run_once()
+
+    d = stats.as_dict()
+    print(
+        f"[annotate] done={d['done']} failed={d['failed']} "
+        f"skipped_budget={d['skipped_budget']} rows={d['rows']} "
+        f"calls={d['calls']} 预估花费 ¥{d['spent']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
