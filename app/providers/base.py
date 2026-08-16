@@ -34,7 +34,7 @@ _ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
 # 可重试的 HTTP 状态码（其余一律当硬错误，重试只会白烧钱）
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
-_CJK_RE = re.compile("[\\u3000-\\u9fff\\uff00-\\uffef]")
+_CJK_RE = re.compile("[　-鿿＀-￯]")
 
 
 def approx_tokens(text: str) -> int:
