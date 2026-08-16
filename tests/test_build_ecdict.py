@@ -38,7 +38,7 @@ def test_mini_dict_lookup_by_lowercase(tmp_path):
     ).fetchone()
     assert row["phonetic"] and row["translation"]
     assert row["word"] == "stakeout"
-    # 索引存在，lookup 不做全表扫描
+    # 索引存在，lookup 不做全表扫
     plan = conn.execute(
         "EXPLAIN QUERY PLAN SELECT * FROM ecdict WHERE word_lower = 'go'"
     ).fetchall()

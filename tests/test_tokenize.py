@@ -114,7 +114,7 @@ def test_tokenize_empty_and_punct_only():
 
 
 def test_contraction_lemmas_use_deterministic_rules():
-    """simplemma 在缩合形上不可靠（it's→its、i'm→i'm），前置规则抃住。"""
+    """simplemma 在缩合形上不可靠（it's→its、i'm→i'm），前置规则兜住。"""
     cases = {
         "it's": "it",
         "i'm": "i",
