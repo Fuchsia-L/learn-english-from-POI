@@ -5,12 +5,27 @@
 ## 现状
 
 - [x] 硬字幕 OCR 提取 (`scripts/extract_hardsub.py`) — 已在 2 分钟 1080p 片段上验证,词级准确率 ~99.7%,全程本地零成本
-- [ ] 字幕解析 / 分词 / 词元归一 (parse_extract)
+- [x] 字幕解析 / 分词 / 词元归一 (`app/ingest.py` + `app/db.py`) — srt → SQLite，token 小写归一、simplemma 词元、不排专名
+- [x] 本地词典 (`scripts/build_ecdict.py`) — ECDICT 77 万词条 → `data/ecdict.db`（音标/中文释义/考试标签/词形变换）
 - [ ] 可点击字幕的本地播放器 (点词查询 → 收藏 → encounter 记录)
 - [ ] AI 助记异步生成 (annotate)
 - [ ] 生词本与复习
 
 核心原则:LLM 只产语义,代码管装配和钱;词元(lexeme)为主键,encounter 记录每次真实语境;按需生产,看到哪集造到哪集。
+
+## ingest：字幕入库
+
+```bash
+pip install -r requirements.txt          # 系统 pip 需加 --break-system-packages
+python scripts/build_ecdict.py           # 克隆 ECDICT → data/ecdict.db（约 190MB 临时占用，用完自删）
+python -m app.ingest episode.en.srt --title "Person of Interest" \
+    --season-ep s01e01 --video episode.mp4 --db data/poi.db
+pytest                                   # 全部夹具为自造句子，不含真实台词
+```
+
+`ingest` 幂等：同一 `(title, season_ep)` 重复跑只更新不新增。每段字幕的 token 化结果
+（`[{surface, lemma, char_start, char_end}]`，char 偏移相对 `text_en`）存在
+`Segment.tokens_json`，供 `GET /segments` 直接吐给前端渲染点击热区。
 
 ## extract_hardsub.py
 

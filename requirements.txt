@@ -1,0 +1,19 @@
+# learn-english-from-POI —— 锁版本（DESIGN §6 全局行）
+# Python 3.11。系统 pip 装包需加 --break-system-packages。
+
+# 字幕解析 / 词元归一（app/ingest.py）
+simplemma==2.0.0
+
+# 本地 Web 应用（app/server.py，M0）
+fastapi==0.141.1
+uvicorn==0.46.0
+starlette==1.0.0
+pydantic==2.13.3
+
+# 硬字幕 OCR（scripts/extract_hardsub.py，另需系统装 ffmpeg + tesseract-ocr[eng]）
+pillow==12.2.0
+numpy==2.4.4
+wordfreq==3.1.1
+
+# 测试
+pytest==9.1.1
