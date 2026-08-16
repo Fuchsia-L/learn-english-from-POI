@@ -1,0 +1,14 @@
+# 版权内容:仓库 Public 期间不入库
+*.srt
+*.ass
+*.vtt
+*.mp4
+*.mkv
+episodes/
+data/
+
+# 杂物
+__pycache__/
+*.pyc
+.DS_Store
+hardsub_*/
