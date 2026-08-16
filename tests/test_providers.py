@@ -1,0 +1,401 @@
+"""provider 插件层：注册表、契约、schema 校验、提示词、真 provider 骨架。
+
+**全程离线**：本文件用 autouse 的 socket 地雷把 socket.socket 打掉，
+任何一次真实网络调用都会当场炸掉测试（DESIGN §5：不接真 API，不花一分钱）。
+"""
+
+from __future__ import annotations
+
+import socket
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.providers import (  # noqa: E402
+    GENERIC_DISCLAIMER,
+    has_disclaimer,
+    MORPH_LABEL,
+    ProviderError,
+    ProviderNotConfigured,
+    ProviderTransientError,
+    SchemaViolation,
+    enforce_labels,
+    get_provider,
+    provider_names,
+    validate_annotation,
+)
+from app.providers import _manual_validate  # noqa: E402
+from app.providers.base import approx_tokens, parse_json_array  # noqa: E402
+from app.providers.fake import FakeInjectedFailure, FakeProvider  # noqa: E402
+from app.providers.prompts import build_user_prompt, debug_dump  # noqa: E402
+
+ITEM = {
+    "lemma": "stakeout",
+    "surface": "stakeout",
+    "pos": "n",
+    "ipa": "ˈsteɪkaʊt",
+    "dict_gloss": "盯梢；监视",
+    "sentence": "I just got called in to a stakeout.",
+    "speaker": None,
+    "episode": "s01e01",
+    "t": 12.33,
+}
+BATCH = [ITEM, {**ITEM, "lemma": "cop", "surface": "cop", "ipa": "kɒp"}]
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """socket 地雷：本文件任何用例只要碰网络就当场失败。"""
+
+    class Boom(socket.socket):
+        def __init__(self, *a, **kw):
+            raise AssertionError("provider 测试不许发起任何网络调用")
+
+    monkeypatch.setattr(socket, "socket", Boom)
+
+
+@pytest.fixture(autouse=True)
+def no_keys(monkeypatch):
+    """确保测试环境里没有真 key（否则骨架用例会想去发请求）。"""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+
+# --- 注册表 ----------------------------------------------------------------
+
+
+def test_registry_has_three_builtins():
+    assert set(provider_names()) >= {"fake", "anthropic", "deepseek"}
+
+
+def test_get_provider_is_case_insensitive_and_trims():
+    assert get_provider("  FAKE ").name == "fake"
+
+
+def test_get_provider_unknown_raises_with_hint():
+    with pytest.raises(ProviderError) as e:
+        get_provider("gpt-9")
+    assert "fake" in str(e.value)
+
+
+def test_provider_protocol_shape():
+    p = get_provider("fake")
+    assert callable(p.annotate) and callable(p.estimate_cost)
+
+
+# --- fake provider ---------------------------------------------------------
+
+
+def test_fake_is_deterministic_and_free():
+    p, q = FakeProvider(), FakeProvider()
+    assert p.annotate(BATCH) == q.annotate(BATCH)
+    assert p.estimate_cost(BATCH) == 0.0
+
+
+def test_fake_output_shape_follows_design_contract():
+    out = FakeProvider().annotate([ITEM])[0]
+    validate_annotation(out)
+    assert out["context_gloss"].startswith("〔fake〕")
+    assert "盯梢；监视" in out["context_gloss"]
+    assert ITEM["sentence"][:20] in out["context_gloss"]
+    morph = next(h for h in out["hooks"] if h["type"] == "morph")
+    assert has_disclaimer(morph["label"])  # DESIGN §5：拆分永远标未经核验
+    assert "核验" in morph["label"]
+
+
+def test_fake_pun_hook_only_when_ipa_present():
+    with_ipa = FakeProvider().annotate([ITEM])[0]
+    without = FakeProvider().annotate([{**ITEM, "ipa": None}])[0]
+    assert any(h["type"] == "pun" for h in with_ipa["hooks"])
+    assert all(h["type"] != "pun" for h in without["hooks"])
+
+
+def test_fake_handles_missing_fields():
+    out = FakeProvider().annotate([{"lemma": "x"}])[0]
+    validate_annotation(out)
+    assert "（词典未收录）" in out["context_gloss"]
+
+
+def test_fake_fail_on_always():
+    p = FakeProvider(fail_on="stakeout")
+    for _ in range(3):
+        with pytest.raises(FakeInjectedFailure):
+            p.annotate([ITEM])
+    assert p.fail_count == 3
+    p.annotate([{**ITEM, "lemma": "other", "surface": "other"}])  # 别的词不受影响
+
+
+def test_fake_fail_times_then_success():
+    p = FakeProvider(fail_on="stakeout", fail_times=1)
+    with pytest.raises(FakeInjectedFailure):
+        p.annotate([ITEM])
+    assert p.annotate([ITEM])[0]["context_gloss"].startswith("〔fake〕")
+
+
+def test_fake_bad_output_and_injectable_cost():
+    bad = FakeProvider(bad_output_on="stakeout").annotate([ITEM])[0]
+    with pytest.raises(SchemaViolation):
+        validate_annotation(bad)
+    assert FakeProvider(cost_per_item=1.5).estimate_cost(BATCH) == 3.0
+
+
+def test_fake_records_calls_for_retry_assertions():
+    p = FakeProvider()
+    p.annotate([ITEM])
+    p.annotate(BATCH)
+    assert [len(c) for c in p.calls] == [1, 2]
+
+
+# --- schema 校验 -----------------------------------------------------------
+
+GOOD = {"context_gloss": "（这句里）临时被叫去执行的盯梢任务", "hooks": []}
+
+BAD_CASES = {
+    "非对象": ["nope"],
+    "缺 context_gloss": {"hooks": []},
+    "缺 hooks": {"context_gloss": "x"},
+    "空 gloss": {"context_gloss": "", "hooks": []},
+    "gloss 非字符串": {"context_gloss": 42, "hooks": []},
+    "hooks 非数组": {"context_gloss": "x", "hooks": "morph"},
+    "多出字段": {"context_gloss": "x", "hooks": [], "factual": "我很确信"},
+    "hook 非对象": {"context_gloss": "x", "hooks": ["morph"]},
+    "hook 缺 label": {"context_gloss": "x", "hooks": [{"type": "morph", "text": "t"}]},
+    "hook type 非法": {
+        "context_gloss": "x",
+        "hooks": [{"type": "Morph 拆分", "text": "t", "label": "l"}],
+    },
+    "hook text 为空": {
+        "context_gloss": "x",
+        "hooks": [{"type": "morph", "text": "", "label": "l"}],
+    },
+    "hook 多出字段": {
+        "context_gloss": "x",
+        "hooks": [{"type": "morph", "text": "t", "label": "l", "confidence": 0.9}],
+    },
+}
+
+
+def test_schema_accepts_design_example():
+    example = {
+        "context_gloss": "（这句里）临时被叫去执行的盯梢任务",
+        "hooks": [
+            {"type": "morph", "text": "stake 桩 + out 在外", "label": "拆分助记，未经词源核验"},
+            {"type": "pun", "text": "死盯凯特", "label": "记忆钩子，非词源"},
+        ],
+    }
+    assert validate_annotation(example) is example
+
+
+@pytest.mark.parametrize("name", sorted(BAD_CASES))
+def test_schema_rejects_malformed(name):
+    with pytest.raises(SchemaViolation):
+        validate_annotation(BAD_CASES[name])
+
+
+@pytest.mark.parametrize("name", sorted(BAD_CASES))
+def test_manual_validator_agrees_with_jsonschema(name):
+    """jsonschema 缺席时的手写兜底必须给出一致判断。"""
+    with pytest.raises(SchemaViolation):
+        _manual_validate(BAD_CASES[name])
+    _manual_validate(GOOD)
+
+
+# --- 免责标签兜底 -----------------------------------------------------------
+
+
+def test_enforce_labels_fixes_morph_label():
+    out = enforce_labels(
+        {"context_gloss": "x", "hooks": [{"type": "morph", "text": "t", "label": "词源"}]}
+    )
+    assert out["hooks"][0]["label"] == MORPH_LABEL
+
+
+def test_enforce_labels_marks_other_hooks_non_etymological():
+    out = enforce_labels(
+        {"context_gloss": "x", "hooks": [{"type": "pun", "text": "t", "label": "谐音"}]}
+    )
+    assert GENERIC_DISCLAIMER in out["hooks"][0]["label"]
+
+
+def test_enforce_labels_keeps_good_labels_and_does_not_mutate():
+    src = {
+        "context_gloss": "x",
+        "hooks": [{"type": "pun", "text": "t", "label": "记忆钩子，非词源"}],
+    }
+    out = enforce_labels(src)
+    assert out["hooks"][0]["label"] == "记忆钩子，非词源"
+    out["hooks"][0]["label"] = "改了"
+    assert src["hooks"][0]["label"] == "记忆钩子，非词源"
+
+
+# --- 提示词 ----------------------------------------------------------------
+
+
+def test_prompt_feeds_ipa_for_pun_hooks():
+    """音标进 prompt 做谐音钩子——这是用户点名要的（工单 3）。"""
+    prompt = build_user_prompt([ITEM])
+    assert "ˈsteɪkaʊt" in prompt
+    assert "ipa" in prompt and "谐音" in prompt
+
+
+def test_prompt_states_output_rules():
+    from app.providers.prompts import SYSTEM_PROMPT
+
+    assert "宁缺毋滥" in SYSTEM_PROMPT
+    assert "非词源" in SYSTEM_PROMPT
+    assert "未经词源核验" in SYSTEM_PROMPT  # morph 永远标未经核验
+    assert "词源" in SYSTEM_PROMPT and "不许" in SYSTEM_PROMPT
+
+
+def test_prompt_carries_every_item_and_count():
+    prompt = build_user_prompt(BATCH)
+    assert prompt.count("### 条目") == 2
+    assert "长度为 2" in prompt or "长度 2" in prompt
+    assert "cop" in prompt and "stakeout" in prompt
+
+
+def test_prompt_renders_missing_fields_as_placeholder():
+    prompt = build_user_prompt([{"lemma": "x"}])
+    assert "（无）" in prompt and "x" in prompt
+
+
+def test_debug_dump_contains_system_and_input():
+    dump = debug_dump([ITEM])
+    assert "=== SYSTEM ===" in dump and "=== USER ===" in dump and "stakeout" in dump
+
+
+# --- 响应解析 --------------------------------------------------------------
+
+
+def test_parse_json_array_variants():
+    assert parse_json_array('[{"a":1}]') == [{"a": 1}]
+    assert parse_json_array('```json\n[{"a":1}]\n```') == [{"a": 1}]
+    assert parse_json_array('好的：\n[{"a":1}]\n希望有用') == [{"a": 1}]
+    assert parse_json_array('{"items":[{"a":1}]}') == [{"a": 1}]  # json_object 模式
+    assert parse_json_array('{"context_gloss":"g","hooks":[]}') == [
+        {"context_gloss": "g", "hooks": []}
+    ]
+
+
+@pytest.mark.parametrize("text", ["", "   ", "没有 JSON", "[不是合法 json"])
+def test_parse_json_array_rejects_garbage(text):
+    with pytest.raises(SchemaViolation):
+        parse_json_array(text)
+
+
+def test_approx_tokens_counts_cjk_heavier():
+    assert approx_tokens("") == 0
+    assert approx_tokens("盯梢监视") > approx_tokens("abcd")
+
+
+# --- 真 provider 骨架（无 key，绝不发包） ----------------------------------
+
+
+@pytest.mark.parametrize("name,env", [("anthropic", "ANTHROPIC_API_KEY"),
+                                      ("deepseek", "DEEPSEEK_API_KEY")])
+def test_real_provider_raises_not_configured_without_key(name, env):
+    p = get_provider(name)
+    assert p.configured is False
+    with pytest.raises(ProviderNotConfigured) as e:
+        p.annotate(BATCH)
+    assert env in str(e.value)
+
+
+@pytest.mark.parametrize("name", ["anthropic", "deepseek"])
+def test_real_provider_assembles_prompt_and_cost_offline(name):
+    """缺 key 也能拼 prompt、算预算——离线调提示词的前提。"""
+    p = get_provider(name)
+    payload = p.payload(BATCH)
+    blob = str(payload)
+    assert p.model and "ˈsteɪkaʊt" in blob and "kɒp" in blob
+    cost = p.estimate_cost(BATCH)
+    assert cost > 0 and p.estimate_cost([]) == 0.0
+
+
+def test_anthropic_payload_shape():
+    p = get_provider("anthropic", api_key="k")
+    payload = p.payload(BATCH)
+    assert payload["messages"][-1] == {"role": "assistant", "content": "["}
+    assert "system" in payload and payload["max_tokens"] > 0
+    assert p.headers()["x-api-key"] == "k"
+
+
+def test_deepseek_payload_shape():
+    p = get_provider("deepseek", api_key="k")
+    payload = p.payload(BATCH)
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["messages"][0]["role"] == "system"
+    assert "items" in payload["messages"][1]["content"]
+    assert p.headers()["authorization"] == "Bearer k"
+
+
+def _resp(text: str, name: str) -> dict:
+    if name == "anthropic":
+        return {"content": [{"type": "text", "text": text}]}
+    return {"choices": [{"message": {"content": text}}]}
+
+
+@pytest.mark.parametrize("name", ["anthropic", "deepseek"])
+def test_real_provider_happy_path_with_injected_transport(name):
+    """注入假传输层跑完整链路：组装 → 解析 → 校验 → 补标签。一个包都不发。"""
+    body = (
+        '[{"context_gloss":"（这句里）临时盯梢任务","hooks":'
+        '[{"type":"morph","text":"stake+out","label":"忘了写免责"}]},'
+        '{"context_gloss":"警察（口语）","hooks":[]}]'
+    )
+    if name == "anthropic":  # 预填 "[" 后模型只会吐剩下的部分
+        body = body[1:]
+    p = get_provider(name, api_key="k", transport=lambda payload: _resp(body, name))
+    out = p.annotate(BATCH)
+    assert len(out) == 2
+    assert out[0]["hooks"][0]["label"] == MORPH_LABEL  # 代码兜底补上免责标签
+    assert out[1]["hooks"] == []
+
+
+def test_real_provider_retries_transient_then_succeeds():
+    calls = {"n": 0}
+
+    def transport(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ProviderTransientError("429 慢点")
+        return _resp('[{"context_gloss":"g","hooks":[]}]', "deepseek")
+
+    p = get_provider("deepseek", api_key="k", transport=transport, sleep=lambda _s: None)
+    assert p.annotate([ITEM])[0]["context_gloss"] == "g"
+    assert calls["n"] == 2
+
+
+def test_real_provider_gives_up_after_retries():
+    calls = {"n": 0}
+
+    def transport(payload):
+        calls["n"] += 1
+        raise ProviderTransientError("503")
+
+    p = get_provider(
+        "deepseek", api_key="k", transport=transport, retries=2, sleep=lambda _s: None
+    )
+    with pytest.raises(ProviderTransientError):
+        p.annotate([ITEM])
+    assert calls["n"] == 3  # 1 次 + 重试 2 次
+
+
+def test_real_provider_rejects_length_mismatch():
+    p = get_provider(
+        "deepseek",
+        api_key="k",
+        transport=lambda _p: _resp('[{"context_gloss":"g","hooks":[]}]', "deepseek"),
+        retries=0,
+    )
+    with pytest.raises(SchemaViolation) as e:
+        p.annotate(BATCH)  # 2 进 1 出
+    assert "条数" in str(e.value)
+
+
+def test_real_provider_empty_batch_short_circuits():
+    p = get_provider("deepseek")  # 没 key 也不该抛：空批次根本不发请求
+    assert p.annotate([]) == []
