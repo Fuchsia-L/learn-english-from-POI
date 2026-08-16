@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POI // 学词终端</title>
+<!--
+  单文件播放器（DESIGN.md §4）。无外部依赖、无 CDN、无浏览器存储 API。
+  设定值全部集中在 JS 顶部的 CONF；坐标一律以 1920x1080 参考帧为准，
+  渲染时按 <video> 实际显示区域（含 letterbox 偏移）换算。
+-->
+<style>
+:root{
+  --bg:#04060a;        /* 近黑底 */
+  --panel:#080d13;
+  --panel-2:#0c131b;
+  --line:#1a2733;      /* 细分隔线 */
+  --fg:#c3d2dd;
+  --dim:#61758a;
+  --acc:#3ff08a;       /* 终端绿 */
+  --amber:#ffb454;     /* 琥珀 */
+  --white:#e9f2f7;     /* POI 监视白框 */
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font:13px/1.5 var(--mono); letter-spacing:.02em;
+  -webkit-font-smoothing:antialiased;
+}
+/* 极克制的扫描线 + 噪点：默认弱到不干扰阅读 */
+#grain{
+  position:fixed; inset:0; z-index:90; pointer-events:none; opacity:.5;
+  background:
+    repeating-linear-gradient(rgba(255,255,255,.020) 0 1px, rgba(0,0,0,0) 1px 3px),
+    radial-gradient(circle at 50% 0%, rgba(63,240,138,.05), rgba(0,0,0,0) 60%);
+}
+button, select, input{font:inherit; color:inherit}
+button{
+  background:var(--panel-2); border:1px solid var(--line); color:var(--fg);
+  padding:5px 10px; cursor:pointer; border-radius:2px;
+}
+button:hover{border-color:var(--dim); color:var(--white)}
+button:disabled{opacity:.45; cursor:default}
+select{
+  background:var(--panel-2); border:1px solid var(--line); color:var(--fg);
+  padding:5px 8px; border-radius:2px; max-width:46vw;
+}
+.k{color:var(--dim)}
+.acc{color:var(--acc)}
+
+/* ---------- 顶栏 ---------- */
+header{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  padding:9px 16px; border-bottom:1px solid var(--line); background:var(--panel);
+}
+.brand{color:var(--acc); font-weight:700; letter-spacing:.16em}
+.brand span{color:var(--dim); font-weight:400; letter-spacing:.02em; margin-left:6px}
+.spacer{flex:1}
+.modes{display:flex; gap:0; border:1px solid var(--line); border-radius:2px; overflow:hidden}
+.modes button{border:0; border-right:1px solid var(--line); border-radius:0; background:transparent}
+.modes button:last-child{border-right:0}
+.modes button.on{background:rgba(63,240,138,.10); color:var(--acc); box-shadow:inset 0 -2px 0 var(--acc)}
+label.chk{display:flex; align-items:center; gap:6px; color:var(--dim); cursor:pointer}
+label.chk input{accent-color:var(--acc)}
+
+/* ---------- 状态行 ---------- */
+#statusbar{
+  display:flex; align-items:center; gap:10px; padding:5px 16px;
+  border-bottom:1px solid var(--line); background:var(--bg); color:var(--dim);
+  font-size:12px; min-height:27px;
+}
+#dot{width:7px; height:7px; border-radius:50%; background:var(--acc); box-shadow:0 0 6px var(--acc)}
+#dot.warn{background:var(--amber); box-shadow:0 0 6px var(--amber)}
+#dot.err{background:#ff5d5d; box-shadow:0 0 6px #ff5d5d}
+
+/* ---------- 舞台 ---------- */
+main{padding:16px; max-width:1680px; margin:0 auto}
+#stage{
+  position:relative; background:#000; border:1px solid var(--line);
+  line-height:0;
+}
+#stage video{display:block; width:100%; aspect-ratio:16/9; max-height:74vh;
+  background:#000; object-fit:contain}
+/* POI 监视框：四角括号 */
+.corner{position:absolute; width:18px; height:18px; border:1px solid var(--white);
+  opacity:.55; pointer-events:none; z-index:5}
+.corner.tl{top:6px; left:6px; border-right:0; border-bottom:0}
+.corner.tr{top:6px; right:6px; border-left:0; border-bottom:0}
+.corner.bl{bottom:6px; left:6px; border-right:0; border-top:0}
+.corner.br{bottom:6px; right:6px; border-left:0; border-top:0}
+
+#layer{position:absolute; inset:0; z-index:4; pointer-events:none}
+#layer > *{pointer-events:none}
+
+/* 遮罩条：磨黑 */
+.mask{
+  position:absolute; display:none;
+  background:rgba(3,5,8,.94);
+  backdrop-filter:blur(7px) saturate(.3);
+  -webkit-backdrop-filter:blur(7px) saturate(.3);
+  border-top:1px solid rgba(255,255,255,.06);
+}
+.mask.on{display:block}
+
+/* 词框热区：平时全透明，hover 才描白框（机器盯梢） */
+.hot{
+  position:absolute; pointer-events:auto; cursor:pointer;
+  border:1px solid transparent; border-radius:1px;
+  transition:border-color .08s linear, background-color .08s linear;
+}
+.hot:hover, .hot.act{
+  border-color:rgba(233,242,247,.92);
+  background:rgba(233,242,247,.10);
+  box-shadow:0 0 0 1px rgba(0,0,0,.55);
+}
+
+/* 退路：自渲染可点击英文字幕行 */
+#fbline{
+  position:absolute; display:none; align-items:center; justify-content:center;
+  text-align:center; padding:0 3%; line-height:1.15;
+  color:var(--white); text-shadow:0 2px 6px #000;
+  font-family:var(--mono); pointer-events:none;
+}
+#fbline.on{display:flex}
+#fbline .tk{pointer-events:auto; cursor:pointer; border-bottom:1px solid transparent}
+#fbline .tk:hover{color:var(--acc); border-bottom-color:var(--acc)}
+
+/* ---------- 播放控制（自绘，避免原生控件与遮罩/热区抢点击） ---------- */
+#controls{
+  display:flex; align-items:center; gap:12px; margin-top:10px;
+  padding:8px 12px; border:1px solid var(--line); background:var(--panel);
+}
+#seek{flex:1; accent-color:var(--acc); background:transparent; cursor:pointer}
+#time{color:var(--dim); font-variant-numeric:tabular-nums; white-space:nowrap}
+#segline{
+  margin-top:10px; padding:8px 12px; border:1px solid var(--line);
+  background:var(--panel); color:var(--dim); min-height:36px;
+}
+#segline b{color:var(--fg); font-weight:400}
+
+/* ---------- 查询卡：机器标记卡片 ---------- */
+#card{
+  position:fixed; right:22px; bottom:22px; width:min(390px, 92vw); z-index:70;
+  display:none; background:var(--panel); border:1px solid var(--line);
+  box-shadow:0 12px 40px rgba(0,0,0,.65);
+}
+#card.on{display:block}
+#card.shift{right:calc(min(390px, 92vw) + 42px)}
+#card::before, #card::after{
+  content:""; position:absolute; width:12px; height:12px; border:1px solid var(--white);
+  opacity:.7; pointer-events:none;
+}
+#card::before{top:-1px; left:-1px; border-right:0; border-bottom:0}
+#card::after{bottom:-1px; right:-1px; border-left:0; border-top:0}
+.cardtop{
+  display:flex; align-items:center; gap:8px; padding:6px 10px;
+  border-bottom:1px solid var(--line); background:linear-gradient(
+    to right, rgba(63,240,138,.10), rgba(0,0,0,0));
+  font-size:11px; letter-spacing:.14em; color:var(--acc);
+}
+.cardtop .x{margin-left:auto; color:var(--dim); cursor:pointer; letter-spacing:0}
+.cardtop .x:hover{color:var(--white)}
+.cardbody{padding:12px 14px 14px}
+.row{display:flex; gap:10px; margin-bottom:7px}
+.row .lb{color:var(--dim); flex:0 0 62px; font-size:12px}
+.row .vl{flex:1; color:var(--fg); word-break:break-word}
+.surface{color:var(--white); font-size:19px; letter-spacing:.03em}
+.lemma{color:var(--acc); font-size:15px}
+.ipa{color:var(--amber)}
+.gloss div{margin-bottom:2px}
+.sent{
+  margin-top:10px; padding:9px 10px; border-left:2px solid var(--line);
+  background:var(--panel-2); color:var(--dim); line-height:1.7;
+}
+.sent .tk{cursor:pointer; color:var(--fg)}
+.sent .tk:hover{color:var(--acc)}
+.sent .tk.hl{color:#04060a; background:var(--acc); padding:0 2px}
+.notice{color:var(--amber); margin-top:8px; font-size:12px}
+.cardfoot{display:flex; align-items:center; gap:10px; margin-top:12px}
+#collectBtn{border-color:var(--acc); color:var(--acc)}
+#collectBtn:hover{background:rgba(63,240,138,.12)}
+#collectBtn.done{border-color:var(--line); color:var(--dim); background:transparent}
+#collectMsg{color:var(--dim); font-size:12px}
+
+/* ---------- 生词本侧栏 ---------- */
+#vocab{
+  position:fixed; top:0; right:0; bottom:0; width:min(390px, 94vw); z-index:80;
+  background:var(--panel); border-left:1px solid var(--line);
+  transform:translateX(102%); transition:transform .16s ease-out;
+  display:flex; flex-direction:column;
+}
+#vocab.on{transform:none}
+.vhead{
+  display:flex; align-items:center; gap:8px; padding:9px 12px;
+  border-bottom:1px solid var(--line); color:var(--acc);
+  font-size:11px; letter-spacing:.14em;
+}
+.vhead .x{margin-left:auto; color:var(--dim); cursor:pointer; letter-spacing:0}
+.vlist{overflow:auto; padding:10px 12px 24px}
+.vcard{border:1px solid var(--line); background:var(--panel-2); padding:10px 11px; margin-bottom:9px}
+.vcard .top{display:flex; align-items:baseline; gap:8px}
+.vcard .lm{color:var(--white); font-size:15px}
+.vcard .ip{color:var(--amber); font-size:12px}
+.vcard .ps{color:var(--dim); font-size:11px; margin-left:auto}
+.vcard .gl{color:var(--fg); margin-top:5px; font-size:12px}
+.vcard .enc{
+  margin-top:7px; padding-top:7px; border-top:1px dashed var(--line);
+  color:var(--dim); font-size:12px; line-height:1.6;
+}
+.vcard .enc em{color:var(--acc); font-style:normal}
+.empty{color:var(--dim); padding:14px 2px; line-height:1.8}
+</style>
+</head>
+<body>
+<div id="grain"></div>
+
+<header>
+  <div class="brand">POI<span>// 学词终端</span></div>
+  <select id="ep" title="选集"><option>加载中…</option></select>
+  <div class="modes" id="modes">
+    <button data-mode="1" title="快捷键 1">1 双语</button>
+    <button data-mode="2" title="快捷键 2">2 遮中文</button>
+    <button data-mode="3" title="快捷键 3">3 裸听</button>
+  </div>
+  <label class="chk" title="点词时是否自动暂停"><input type="checkbox" id="pauseChk" checked> 点词暂停</label>
+  <div class="spacer"></div>
+  <button id="vocabBtn">生词本 [V]</button>
+</header>
+
+<div id="statusbar"><span id="dot"></span><span id="status">初始化…</span></div>
+
+<main>
+  <div id="stage">
+    <video id="video" playsinline preload="metadata"></video>
+    <div id="layer">
+      <div class="mask" id="mask"></div>
+      <div id="hots"></div>
+      <div id="fbline"></div>
+    </div>
+    <i class="corner tl"></i><i class="corner tr"></i>
+    <i class="corner bl"></i><i class="corner br"></i>
+  </div>
+
+  <div id="controls">
+    <button id="playBtn" title="播放 / 暂停">▶ 播放</button>
+    <button id="prevSeg" title="上一段">◀ 段</button>
+    <button id="nextSeg" title="下一段">段 ▶</button>
+    <input type="range" id="seek" min="0" max="0" step="0.01" value="0" title="进度">
+    <span id="time">00:00 / 00:00</span>
+  </div>
+
+  <div id="segline"><span class="k">当前段</span> <b id="segtext">—</b></div>
+</main>
+
+<div id="card">
+  <div class="cardtop"><span>■ LOOKUP // LOCAL</span><span class="x" id="cardX">[关闭 ESC]</span></div>
+  <div class="cardbody" id="cardBody"></div>
+</div>
+
+<aside id="vocab">
+  <div class="vhead"><span>■ VOCAB // 生词本</span><span class="x" id="vocabX">[关闭 V]</span></div>
+  <div class="vlist" id="vlist"></div>
+</aside>
+
+<script>
+(function(){
+"use strict";
+
+/* ========== 常量（DESIGN §4；1080p 参考帧坐标，换片源改这里） ========== */
+var CONF = {
+  REF_W: 1920,
+  REF_H: 1080,
+  CN_BAND: [958, 1026],    // 中文行（档 2 遮这里）
+  EN_BAND: [1026, 1080],   // 英文行（烧录字幕，热区盖这里）
+  HOT_PAD: 3,              // 热区四周外扩（参考帧像素），便于点中
+  BOX_MIN_RATIO: 0.5,      // 有效词框比例低于此值 → 该段走自渲染退路
+  SYNC_MS: 120             // 兜底轮询（timeupdate 约 4Hz，不够跟手）
+};
+
+/* ========== 小工具 ========== */
+function $(id){ return document.getElementById(id); }
+function el(tag, cls, text){
+  var n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function clear(n){ while (n.firstChild) n.removeChild(n.firstChild); }
+function fmtTime(t){
+  if (!isFinite(t) || t < 0) t = 0;
+  var m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+}
+function setStatus(msg, kind){
+  $("status").textContent = msg;
+  $("dot").className = kind || "";
+}
+async function api(path, opts){
+  var r = await fetch(path, opts);
+  if (!r.ok) {
+    var detail = "";
+    try { detail = (await r.json()).detail || ""; } catch (e) { detail = ""; }
+    var err = new Error("HTTP " + r.status + (detail ? " " + detail : ""));
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+/* 词典释义里的分隔符是字面两个字符 "\\n"（见 build_ecdict._clean_text），
+   顺手也吃真换行。 */
+function glossLines(g){
+  return String(g == null ? "" : g).split(/\\n|\n/)
+    .map(function(s){ return s.trim(); })
+    .filter(function(s){ return s.length > 0; });
+}
+/* 与服务端 _clean_surface 同口径：小写 + 撇号归一 + 剥首尾标点 */
+function normSurface(raw){
+  var s = String(raw == null ? "" : raw).toLowerCase()
+    .replace(/[’ʼ]/g, "'");
+  return s.replace(/^["'“”‘’.,!?;:()\[\]{}…\-—–]+/, "")
+          .replace(/["'“”‘’.,!?;:()\[\]{}…\-—–]+$/, "");
+}
+
+/* ========== 状态 ========== */
+var S = {
+  episodes: [],
+  contentId: null,
+  segments: [],
+  mode: 2,               // 默认档 2（只遮中文），DESIGN §4 核心学习模式
+  segIndex: -1,
+  pauseOnClick: true,    // 只存在 JS 变量里（禁用任何浏览器存储 API）
+  pausedByCard: false,
+  card: null,            // 当前查询卡数据
+  vocabOpen: false,
+  seeking: false,
+  renderKey: "",
+  fallbackNoted: false
+};
+
+var video = $("video");
+
+/* ========== 几何：参考帧坐标 → 屏幕像素 ==========
+   <video> 用 object-fit:contain，画面实际区域比元素小（letterbox）。
+   先算画面区域，再按 1920x1080 参考帧等比映射。 */
+function stageGeom(){
+  var r = video.getBoundingClientRect();
+  var vw = video.videoWidth || CONF.REF_W;
+  var vh = video.videoHeight || CONF.REF_H;
+  if (!r.width || !r.height) return { x:0, y:0, w:0, h:0, sx:0, sy:0 };
+  var scale = Math.min(r.width / vw, r.height / vh);
+  var w = vw * scale, h = vh * scale;
+  return {
+    x: (r.width - w) / 2,       // letterbox 左右留白
+    y: (r.height - h) / 2,      // letterbox 上下留白
+    w: w, h: h,
+    sx: w / CONF.REF_W,         // 参考帧 → 屏幕
+    sy: h / CONF.REF_H
+  };
+}
+function placeRef(node, x, y, w, h, g){
+  node.style.left   = (g.x + x * g.sx) + "px";
+  node.style.top    = (g.y + y * g.sy) + "px";
+  node.style.width  = Math.max(0, w * g.sx) + "px";
+  node.style.height = Math.max(0, h * g.sy) + "px";
+}
+
+/* ========== 段定位（预排序 + 二分） ========== */
+function findSegment(t){
+  var segs = S.segments, lo = 0, hi = segs.length - 1, ans = -1;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    if (segs[mid].t_start <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  if (ans >= 0 && t <= segs[ans].t_end) return ans;
+  return -1;
+}
+function curSeg(){
+  return S.segIndex >= 0 ? S.segments[S.segIndex] : null;
+}
+
+/* ========== 词框可用性判定（退路开关） ========== */
+function usableBoxes(seg){
+  var b = seg && seg.word_boxes;
+  if (!b || !b.length) return null;
+  var good = [];
+  for (var i = 0; i < b.length; i++) {
+    var w = b[i];
+    if (w && w.x != null && w.y != null && w.width > 0 && w.height > 0 && w.w) good.push(w);
+  }
+  if (!good.length) return null;
+  // 丢框不丢词：个别词没框就跳过；整段大面积丢框才退化为自渲染
+  if (good.length < b.length * CONF.BOX_MIN_RATIO) return null;
+  return good;
+}
+
+/* ========== 渲染 ========== */
+function render(force){
+  var g = stageGeom();
+  var seg = curSeg();
+  var key = [S.mode, seg ? seg.id : 0, Math.round(g.w), Math.round(g.h)].join("|");
+  if (!force && key === S.renderKey) return;
+  S.renderKey = key;
+
+  var mask = $("mask"), hots = $("hots"), fb = $("fbline");
+  clear(hots);
+  clear(fb);
+  fb.classList.remove("on");
+  mask.classList.remove("on");
+
+  // 档 3 是裸听：文字面板也不能漏字幕（否则遮了画面等于白遮）
+  $("segtext").textContent = (!seg || S.mode === 3)
+    ? (S.mode === 3 && seg ? "（裸听：字幕已隐藏，切 1 / 2 查看）" : "—")
+    : seg.text_en.replace(/\n/g, " ");
+  if (!g.w) return;
+
+  var boxes = seg ? usableBoxes(seg) : null;
+  var fallback = !!seg && !boxes;
+
+  // --- 遮罩 ---
+  if (S.mode === 3) {
+    placeRef(mask, 0, CONF.CN_BAND[0], CONF.REF_W, CONF.EN_BAND[1] - CONF.CN_BAND[0], g);
+    mask.classList.add("on");
+  } else if (S.mode === 2) {
+    // 有词框：只遮中文行，英文照旧原位可点
+    // 无词框（退路）：中英全遮 + 下沿自渲染可点击英文行（DESIGN §4 对齐退路）
+    var top = CONF.CN_BAND[0];
+    var bottom = fallback ? CONF.EN_BAND[1] : CONF.CN_BAND[1];
+    placeRef(mask, 0, top, CONF.REF_W, bottom - top, g);
+    mask.classList.add("on");
+  }
+
+  // --- 热区 / 退路字幕 ---
+  if (S.mode !== 3 && seg) {
+    if (boxes) {
+      for (var i = 0; i < boxes.length; i++) renderHot(hots, boxes[i], seg, g);
+    } else if (S.mode === 2) {
+      renderFallbackLine(fb, seg, g);
+    }
+    // 档 1 无词框：DESIGN §4 明写「档 1 降级为仅展示不可点」，不自渲染（画面本来就有字）
+  }
+  updateHint(seg, boxes, fallback);
+}
+
+function renderHot(host, box, seg, g){
+  var d = el("div", "hot");
+  d.dataset.surface = box.w;
+  d.title = box.w;
+  placeRef(d, box.x - CONF.HOT_PAD, box.y - CONF.HOT_PAD,
+           box.width + CONF.HOT_PAD * 2, box.height + CONF.HOT_PAD * 2, g);
+  d.addEventListener("click", function(ev){
+    ev.stopPropagation();
+    openCard(box.w, seg, d);
+  });
+  host.appendChild(d);
+}
+
+function renderFallbackLine(host, seg, g){
+  // 定位在遮罩下沿（英文行那一条），字号跟着画面缩放走
+  placeRef(host, 0, CONF.EN_BAND[0], CONF.REF_W, CONF.EN_BAND[1] - CONF.EN_BAND[0], g);
+  var band = (CONF.EN_BAND[1] - CONF.EN_BAND[0]) * g.sy;
+  host.style.fontSize = Math.max(11, band * 0.56) + "px";
+  var line = el("div");
+  var text = seg.text_en, toks = seg.tokens || [], pos = 0;
+  for (var i = 0; i < toks.length; i++) {
+    var tk = toks[i];
+    if (tk.char_start > pos) line.appendChild(document.createTextNode(text.slice(pos, tk.char_start)));
+    (function(word){
+      var sp = el("span", "tk", text.slice(word.char_start, word.char_end));
+      sp.dataset.surface = word.surface;
+      sp.addEventListener("click", function(ev){
+        ev.stopPropagation();
+        openCard(word.surface, seg, sp);
+      });
+      line.appendChild(sp);
+    })(tk);
+    pos = tk.char_end;
+  }
+  if (pos < text.length) line.appendChild(document.createTextNode(text.slice(pos)));
+  if (!toks.length) line.appendChild(document.createTextNode(text));
+  host.appendChild(line);
+  host.classList.add("on");
+}
+
+function updateHint(seg, boxes, fallback){
+  if (!seg) return;
+  if (fallback && !S.fallbackNoted) {
+    S.fallbackNoted = true;
+    setStatus(S.mode === 1
+      ? "第 " + seg.idx + " 段无可用词框 → 档 1 降级为仅展示不可点（DESIGN §4）"
+      : "第 " + seg.idx + " 段无可用词框 → 已启用自渲染字幕退路（档 2 中英全遮）", "warn");
+  } else if (boxes) {
+    var lost = (seg.word_boxes ? seg.word_boxes.length : 0) - boxes.length;
+    if (S.fallbackNoted || lost > 0) {
+      S.fallbackNoted = false;
+      setStatus("档 " + S.mode + " // 热区 " + boxes.length + " 个" +
+                (lost > 0 ? " // " + lost + " 个词丢框不可点" : ""), lost > 0 ? "warn" : null);
+    }
+  }
+}
+
+/* ========== 同步 ========== */
+function sync(){
+  var t = video.currentTime || 0;
+  var i = findSegment(t);
+  if (i !== S.segIndex) S.segIndex = i;
+  render(false);
+  if (!S.seeking) {
+    var dur = isFinite(video.duration) ? video.duration : 0;
+    if (dur && $("seek").max != dur) $("seek").max = dur;
+    $("seek").value = t;
+    $("time").textContent = fmtTime(t) + " / " + fmtTime(dur);
+  }
+}
+
+/* ========== 查询卡 ========== */
+async function openCard(surface, seg, anchor){
+  var norm = normSurface(surface);
+  if (!norm) return;
+  if (S.pauseOnClick && !video.paused) {
+    video.pause();
+    S.pausedByCard = true;
+  }
+  document.querySelectorAll(".hot.act").forEach(function(n){ n.classList.remove("act"); });
+  if (anchor && anchor.classList.contains("hot")) anchor.classList.add("act");
+
+  S.card = { surface: norm, seg: seg, data: null, loading: true };
+  drawCard();
+  try {
+    var d = await api("/lookup?surface=" + encodeURIComponent(norm) +
+                      "&segment_id=" + encodeURIComponent(seg.id));
+    if (!S.card || S.card.surface !== norm) return;   // 期间点了别的词
+    S.card.data = d;
+    S.card.loading = false;
+    drawCard();
+  } catch (e) {
+    if (!S.card) return;
+    S.card.loading = false;
+    S.card.error = String(e.message || e);
+    drawCard();
+  }
+}
+
+function drawCard(){
+  var card = $("card"), body = $("cardBody");
+  clear(body);
+  if (!S.card) { card.classList.remove("on"); return; }
+  card.classList.add("on");
+  card.classList.toggle("shift", S.vocabOpen);
+
+  var c = S.card, d = c.data;
+  if (c.loading) { body.appendChild(el("div", "k", "查询中…")); return; }
+  if (c.error) { body.appendChild(el("div", "notice", "查询失败：" + c.error)); return; }
+
+  body.appendChild(row("当前形式", el("span", "surface", d.surface)));
+  body.appendChild(row("词元", el("span", "lemma", d.lemma + (d.pos ? "  [" + d.pos + "]" : ""))));
+  body.appendChild(row("音标", el("span", "ipa", d.ipa ? "/" + d.ipa + "/" : "—")));
+
+  var gl = el("div", "gloss");
+  var lines = glossLines(d.dict_gloss);
+  if (lines.length) {
+    lines.forEach(function(t){ gl.appendChild(el("div", null, t)); });
+  } else {
+    gl.appendChild(el("div", "k", "—"));
+  }
+  body.appendChild(row("释义", gl));
+
+  if (!d.in_dict) {
+    body.appendChild(el("div", "notice", "词典未收录（专名？）— 词元按 " + d.lemma + " 记录"));
+  }
+
+  // 原句：token 可点，点中的词高亮
+  var seg = c.seg;
+  var sent = el("div", "sent");
+  var text = seg.text_en, toks = seg.tokens || [], pos = 0;
+  for (var i = 0; i < toks.length; i++) {
+    var tk = toks[i];
+    if (tk.char_start > pos) sent.appendChild(document.createTextNode(text.slice(pos, tk.char_start)));
+    (function(word){
+      var sp = el("span", "tk", text.slice(word.char_start, word.char_end));
+      if (normSurface(word.surface) === c.surface) sp.classList.add("hl");
+      sp.addEventListener("click", function(ev){
+        ev.stopPropagation();
+        openCard(word.surface, seg, null);
+      });
+      sent.appendChild(sp);
+    })(tk);
+    pos = tk.char_end;
+  }
+  if (pos < text.length) sent.appendChild(document.createTextNode(text.slice(pos)));
+  if (!toks.length) sent.appendChild(document.createTextNode(text));
+  body.appendChild(sent);
+
+  var foot = el("div", "cardfoot");
+  var btn = el("button", null, d.collected ? "已在生词本" : "加入生词本");
+  btn.id = "collectBtn";
+  if (d.collected) btn.classList.add("done");
+  btn.disabled = !!d.collected;
+  btn.addEventListener("click", function(ev){ ev.stopPropagation(); doCollect(); });
+  foot.appendChild(btn);
+  var msg = el("span", null, "");
+  msg.id = "collectMsg";
+  if (d.collected) msg.textContent = "已收";
+  foot.appendChild(msg);
+  body.appendChild(foot);
+}
+
+function row(label, valueNode){
+  var r = el("div", "row");
+  r.appendChild(el("div", "lb", label));
+  var v = el("div", "vl");
+  v.appendChild(valueNode);
+  r.appendChild(v);
+  return r;
+}
+
+async function doCollect(){
+  if (!S.card || !S.card.data) return;
+  var btn = $("collectBtn"), msg = $("collectMsg");
+  btn.disabled = true;
+  msg.textContent = "写入中…";
+  try {
+    var d = await api("/collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ surface: S.card.surface, segment_id: S.card.seg.id })
+    });
+    S.card.data.collected = true;
+    S.card.data.lexeme_id = d.lexeme_id;
+    if (d.ipa && !S.card.data.ipa) S.card.data.ipa = d.ipa;
+    if (d.dict_gloss && !S.card.data.dict_gloss) S.card.data.dict_gloss = d.dict_gloss;
+    btn.textContent = "已在生词本";
+    btn.classList.add("done");
+    msg.textContent = d.created ? "已收 // 新词条" : "已收 // 第 " + d.encounters + " 次相遇";
+    setStatus("已收藏 " + d.lemma, null);
+    loadVocab();
+  } catch (e) {
+    btn.disabled = false;
+    msg.textContent = "失败：" + (e.message || e);
+  }
+}
+
+function closeCard(){
+  if (!S.card) return;
+  S.card = null;
+  $("card").classList.remove("on");
+  clear($("cardBody"));
+  document.querySelectorAll(".hot.act").forEach(function(n){ n.classList.remove("act"); });
+  if (S.pausedByCard) {
+    S.pausedByCard = false;
+    var p = video.play();
+    if (p && p.catch) p.catch(function(){});
+  }
+}
+
+/* ========== 生词本侧栏（M0 只读） ========== */
+async function loadVocab(){
+  var host = $("vlist");
+  try {
+    var d = await api("/vocab");
+    clear(host);
+    if (!d.count) {
+      host.appendChild(el("div", "empty", "生词本还是空的。\n在画面上点一个英文词，它就会出现在这里。"));
+      return;
+    }
+    d.vocab.forEach(function(v){ host.appendChild(vocabCard(v)); });
+  } catch (e) {
+    clear(host);
+    host.appendChild(el("div", "empty", "生词本加载失败：" + (e.message || e)));
+  }
+}
+
+function vocabCard(v){
+  var c = el("div", "vcard");
+  var top = el("div", "top");
+  top.appendChild(el("span", "lm", v.lemma));
+  if (v.ipa) top.appendChild(el("span", "ip", "/" + v.ipa + "/"));
+  top.appendChild(el("span", "ps", v.pos ? v.pos : ""));
+  c.appendChild(top);
+
+  var gl = el("div", "gl");
+  var lines = glossLines(v.dict_gloss);
+  if (lines.length) {
+    lines.forEach(function(t){ gl.appendChild(el("div", null, t)); });
+  } else {
+    gl.appendChild(el("div", "k", "（暂无词典释义）"));
+  }
+  c.appendChild(gl);
+
+  (v.encounters || []).forEach(function(e){
+    var box = el("div", "enc");
+    var head = (e.season_ep ? e.season_ep + " " : "") + fmtTime(e.t_start || 0);
+    box.appendChild(el("span", "k", head + " · "));
+    box.appendChild(el("em", null, e.surface));
+    box.appendChild(document.createElement("br"));
+    box.appendChild(document.createTextNode((e.sentence || "").replace(/\n/g, " ")));
+    c.appendChild(box);
+  });
+  return c;
+}
+
+function setVocab(open){
+  S.vocabOpen = open;
+  $("vocab").classList.toggle("on", open);
+  $("card").classList.toggle("shift", open && !!S.card);
+  if (open) loadVocab();
+}
+
+/* ========== 加载数据 ========== */
+async function loadEpisodes(){
+  setStatus("拉取集列表…");
+  var d = await api("/episodes");
+  S.episodes = d.episodes || [];
+  var sel = $("ep");
+  clear(sel);
+  if (!S.episodes.length) {
+    sel.appendChild(el("option", null, "（库里没有内容，先跑 app.ingest）"));
+    setStatus("库里没有已入库的集数：python -m app.ingest <srt> --title … --season-ep …", "warn");
+    return;
+  }
+  S.episodes.forEach(function(e){
+    var o = el("option", null,
+      e.season_ep + "  " + e.title + "  · " + e.segments + " 段" + (e.has_video ? "" : "  [无视频]"));
+    o.value = String(e.id);
+    sel.appendChild(o);
+  });
+  var first = S.episodes.filter(function(e){ return e.has_video; })[0] || S.episodes[0];
+  sel.value = String(first.id);
+  await loadEpisode(first.id);
+}
+
+async function loadEpisode(id){
+  id = Number(id);
+  S.contentId = id;
+  setStatus("拉取字幕…");
+  var d = await api("/segments?content_id=" + id);
+  S.segments = (d.segments || []).slice().sort(function(a, b){ return a.t_start - b.t_start; });
+  S.segIndex = -1;
+  S.renderKey = "";
+  S.fallbackNoted = false;
+  S.pausedByCard = false;   // 换集不要因为关卡把新片子自动播起来
+  closeCard();
+  video.pause();
+  video.src = "/media/" + id;
+  video.load();
+  var withBoxes = S.segments.filter(function(s){ return !!usableBoxes(s); }).length;
+  setStatus(d.season_ep + " " + d.title + " // " + S.segments.length + " 段 // 词框 " +
+            withBoxes + " 段" + (withBoxes < S.segments.length ? "（其余走自渲染退路）" : ""));
+  render(true);
+}
+
+/* ========== 交互绑定 ========== */
+function setMode(m){
+  S.mode = m;
+  Array.prototype.forEach.call($("modes").children, function(b){
+    b.classList.toggle("on", Number(b.dataset.mode) === m);
+  });
+  S.fallbackNoted = false;
+  render(true);
+}
+
+$("modes").addEventListener("click", function(ev){
+  var b = ev.target.closest("button[data-mode]");
+  if (b) setMode(Number(b.dataset.mode));
+});
+$("ep").addEventListener("change", function(){
+  if ($("ep").value) loadEpisode($("ep").value).catch(function(e){
+    setStatus("加载失败：" + (e.message || e), "err");
+  });
+});
+$("pauseChk").addEventListener("change", function(){ S.pauseOnClick = $("pauseChk").checked; });
+$("vocabBtn").addEventListener("click", function(){ setVocab(!S.vocabOpen); });
+$("vocabX").addEventListener("click", function(){ setVocab(false); });
+$("cardX").addEventListener("click", function(ev){ ev.stopPropagation(); closeCard(); });
+
+$("playBtn").addEventListener("click", togglePlay);
+function togglePlay(){
+  if (video.paused) {
+    S.pausedByCard = false;
+    var p = video.play();
+    if (p && p.catch) p.catch(function(e){ setStatus("播放失败：" + e.message, "err"); });
+  } else {
+    video.pause();
+  }
+}
+video.addEventListener("play", function(){ $("playBtn").textContent = "⏸ 暂停"; });
+video.addEventListener("pause", function(){ $("playBtn").textContent = "▶ 播放"; });
+video.addEventListener("click", function(ev){ if (ev.target === video) togglePlay(); });
+video.addEventListener("error", function(){
+  setStatus("媒体加载失败（该集可能没有登记 video_path，或文件不存在）", "err");
+});
+
+$("prevSeg").addEventListener("click", function(){ jumpSeg(-1); });
+$("nextSeg").addEventListener("click", function(){ jumpSeg(1); });
+function jumpSeg(step){
+  if (!S.segments.length) return;
+  var i = S.segIndex;
+  if (i < 0) {
+    var t = video.currentTime || 0;
+    i = -1;
+    for (var k = 0; k < S.segments.length; k++) {
+      if (S.segments[k].t_start <= t) i = k; else break;
+    }
+    if (step > 0) i = i + 1; // 落在间隙里：下一段就是紧邻的那段
+  } else {
+    i = i + step;
+  }
+  i = Math.max(0, Math.min(S.segments.length - 1, i));
+  video.currentTime = S.segments[i].t_start + 0.01;
+  sync();
+}
+
+$("seek").addEventListener("input", function(){
+  S.seeking = true;
+  $("time").textContent = fmtTime(Number($("seek").value)) + " / " +
+    fmtTime(isFinite(video.duration) ? video.duration : 0);
+});
+$("seek").addEventListener("change", function(){
+  video.currentTime = Number($("seek").value);
+  S.seeking = false;
+  sync();
+});
+
+["timeupdate", "seeked", "seeking", "loadedmetadata", "durationchange", "play", "pause"]
+  .forEach(function(evt){ video.addEventListener(evt, function(){ sync(); }); });
+setInterval(sync, CONF.SYNC_MS);
+
+window.addEventListener("resize", function(){ render(true); });
+if (window.ResizeObserver) new ResizeObserver(function(){ render(true); }).observe(video);
+
+// 点卡外关卡（捕获阶段拿不到 stopPropagation 之外的干扰）
+document.addEventListener("click", function(ev){
+  if (!S.card) return;
+  if ($("card").contains(ev.target)) return;
+  if ($("vocab").contains(ev.target)) return;
+  closeCard();
+});
+
+document.addEventListener("keydown", function(ev){
+  var t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (ev.key === "1" || ev.key === "2" || ev.key === "3") { setMode(Number(ev.key)); ev.preventDefault(); }
+  else if (ev.key === "v" || ev.key === "V") { setVocab(!S.vocabOpen); ev.preventDefault(); }
+  else if (ev.key === "Escape") {
+    if (S.card) closeCard();
+    else if (S.vocabOpen) setVocab(false);
+  }
+  else if (ev.key === " ") {
+    // 焦点还在按钮上时，空格会顺带再激活那个按钮一次 → 先摘掉焦点
+    if (t && t.tagName === "BUTTON") t.blur();
+    togglePlay();
+    ev.preventDefault();
+  }
+  else if (ev.key === "ArrowLeft") { video.currentTime = Math.max(0, video.currentTime - 5); }
+  else if (ev.key === "ArrowRight") { video.currentTime = video.currentTime + 5; }
+});
+
+/* ========== 启动 ========== */
+setMode(2);           // 档 2 是默认档（DESIGN §4 核心学习模式）
+loadVocab();
+loadEpisodes().catch(function(e){
+  setStatus("初始化失败：" + (e.message || e), "err");
+});
+
+})();
+</script>
+</body>
+</html>
