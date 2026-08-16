@@ -125,3 +125,4 @@ scripts/
 - Wiktionary 词源解析（事实区的前置条件），远期。
 - 复习调度：M1 先"最近几天滚动 + 会/不会"，FSRS 以后再说。
 - DeepSeek provider 正式接入（含费用核算脚本）。
+- 重构债：ECDICT 查询/回填口径（EcdictStore 等）现居 app/server.py，annotate worker 反向依赖 web 层——待抽到 app/ecdict.py（工单5 偏离点 #5）。
