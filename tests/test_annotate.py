@@ -160,9 +160,10 @@ def test_pack_contains_design_fields(client: TestClient, env: dict):
         w.run_once()
     pack = p.calls[0][0]
     assert set(pack) == {
-        "lemma", "surface", "pos", "ipa", "dict_gloss",
+        "id", "lemma", "surface", "pos", "ipa", "dict_gloss",
         "sentence", "speaker", "episode", "t",
     }
+    assert pack["id"].isdigit()  # 对位键 = AnnotationJob.id（工单 6-2）
     assert pack["lemma"] == "camera" and pack["surface"] == "cameras"
     assert pack["episode"] == "s01e01" and pack["speaker"] is None
     assert pack["t"] == pytest.approx(8.0)
@@ -267,6 +268,63 @@ def test_high_priority_ignores_budget(client: TestClient, env: dict):
         stats = w.run_once()
     assert stats.done == 1 and stats.skipped_budget == 1
     assert [c[0]["lemma"] for c in p.calls] == ["camera"]
+    # 不受限 ≠ 不记账：高优先级的花费照样进 est_cost（工单 6-1）
+    assert stats.est_cost == pytest.approx(99.0)
+
+
+def test_budget_is_not_blown_by_retries(env: dict, logs: list):
+    """工单 6-1：重试也要先过预算关。
+
+    老实现每批只在入口记一次账：4 个任务 × 每次调用 ¥1、retries=2 时，
+    记账只算 ¥4，实际却调了 12 次 = ¥12。现在每次真实调用前记账 + 校预算，
+    总花费不可能越过「预算 + 最后一次调用」这条线。
+    """
+    for lemma in ("gardener", "cheap", "nobody", "street"):
+        enqueue(env["db"], lemma, priority=0)
+    p = FakeProvider(cost_per_item=1.0, fail_on=("gardener", "cheap", "nobody", "street"))
+    with make_worker(
+        env, provider=p, batch_size=1, budget=4.0, retries=2, logs=logs
+    ) as w:
+        stats = w.run_once()
+
+    per_call_max = 1.0  # batch_size=1 × cost_per_item
+    assert stats.calls == 4                       # 老实现在这里会调 12 次
+    assert len(p.calls) == stats.calls            # provider 侧的实际调用次数一致
+    assert stats.est_cost == pytest.approx(4.0)
+    assert stats.est_cost <= 4.0 + per_call_max   # 预算 + 单次调用上限
+    assert stats.skipped_budget == 3 and stats.failed == 1
+    assert any("预算已用尽" in m for m in logs)
+
+    conn = get_conn(env["db"])
+    left = conn.execute(
+        "SELECT COUNT(*) c FROM AnnotationJob WHERE status = 'queued'"
+    ).fetchone()["c"]
+    conn.close()
+    assert left == 3  # 没送出去的（含被预算掐掉的那批）全部保持 queued
+
+
+def test_every_retry_is_charged(env: dict):
+    """重试计费：失败一次再成功 = 两次调用 = 两次记账。"""
+    enqueue(env["db"], "gardener")
+    p = FakeProvider(cost_per_item=0.5, fail_on="gardener", fail_times=1)
+    with make_worker(env, provider=p, batch_size=1, budget=10.0, retries=2) as w:
+        stats = w.run_once()
+    assert stats.done == 1 and stats.calls == 2
+    assert stats.est_cost == pytest.approx(1.0)  # 0.5 × 2 次调用
+    assert stats.as_dict()["est_cost"] == pytest.approx(1.0)
+
+
+def test_budget_stops_mid_batch_retry_and_requeues(env: dict, logs: list):
+    """预算在重试中途用尽：该任务放回 queued，不是 failed。"""
+    job = enqueue(env["db"], "gardener")
+    p = FakeProvider(cost_per_item=1.0, fail_on="gardener")
+    with make_worker(
+        env, provider=p, batch_size=1, budget=2.0, retries=5, logs=logs
+    ) as w:
+        stats = w.run_once()
+    assert stats.calls == 2 and stats.est_cost == pytest.approx(2.0)
+    assert stats.failed == 0 and stats.skipped_budget == 1
+    assert job_status(env["db"], job)["status"] == "queued"
 
 
 # --- 重试 / 失败 ------------------------------------------------------------
@@ -379,7 +437,95 @@ def test_wrong_output_count_is_rejected(env: dict):
     assert stats.failed == 2 and stats.rows == 0
 
 
-# --- Mnemonic 落库口径 -----------------------------------------------------
+# --- 按 id 对位（工单 6-2：批量助记不许串词） ------------------------------
+
+
+def lexeme_id_of(db: Path, lemma: str) -> int:
+    conn = get_conn(db)
+    row = conn.execute("SELECT id FROM Lexeme WHERE lemma = ?", (lemma,)).fetchone()
+    conn.close()
+    assert row is not None
+    return int(row["id"])
+
+
+def marked_hooks(item: dict) -> list[dict]:
+    """把 lemma 写进 hook 文本，落库后一眼看出这条助记原本属于谁。"""
+    return [
+        {
+            "type": "morph",
+            "text": f"这条属于 {item['lemma']}",
+            "label": "拆分助记，未经词源核验",
+        }
+    ]
+
+
+def hook_texts(db: Path, lemma: str) -> list[str]:
+    return [
+        json.loads(r["payload_json"]).get("text", "")
+        for r in mnemonic_rows(db, lexeme_id_of(db, lemma))
+    ]
+
+
+def test_shuffled_provider_output_still_lands_on_the_right_lexeme(env: dict):
+    """模型把数组顺序打乱：按 id 对位，助记必须还落在自己那个 lexeme 上。"""
+    for lemma in ("gardener", "cheap", "nobody"):
+        enqueue(env["db"], lemma, priority=0)
+    p = FakeProvider(shuffle=True, hooks_for=marked_hooks)
+    with make_worker(env, provider=p, batch_size=3) as w:
+        stats = w.run_once()
+    assert stats.done == 3 and len(p.calls) == 1
+    for lemma in ("gardener", "cheap", "nobody"):
+        assert any(f"这条属于 {lemma}" in t for t in hook_texts(env["db"], lemma))
+
+
+def test_wrong_id_element_is_dropped_and_only_that_job_retries(env: dict, logs: list):
+    """一条输出的 id 是模型编的：丢掉它、只重试它，同批其余照常落库。"""
+    for lemma in ("gardener", "cheap"):
+        enqueue(env["db"], lemma, priority=0)
+    p = FakeProvider(wrong_id_on="gardener", hooks_for=marked_hooks)
+    with make_worker(env, provider=p, batch_size=2, retries=1, logs=logs) as w:
+        stats = w.run_once()
+
+    assert stats.done == 1 and stats.failed == 1
+    # 下一轮只重试没对上的那条，不重发已经成功的
+    assert [[i["lemma"] for i in c] for c in p.calls] == [
+        ["gardener", "cheap"], ["gardener"]
+    ]
+    assert any("对不上" in m for m in logs)
+    assert any("这条属于 cheap" in t for t in hook_texts(env["db"], "cheap"))
+    assert hook_texts(env["db"], "gardener") == []  # 串不进去，一行都没落
+
+
+def test_missing_id_element_is_dropped(env: dict):
+    """模型忘了带 id：整条作废（宁可重试，也不赌顺序）。"""
+    enqueue(env["db"], "gardener")
+    p = FakeProvider(drop_id_on="gardener")
+    with make_worker(env, provider=p, batch_size=1, retries=1) as w:
+        stats = w.run_once()
+    assert stats.failed == 1 and stats.rows == 0 and stats.calls == 2
+
+
+def test_duplicate_id_poisons_both_copies(env: dict):
+    """同一个 id 回来两次：两条都不要，该任务重试。"""
+    for lemma in ("gardener", "cheap"):
+        enqueue(env["db"], lemma, priority=0)
+    p = FakeProvider(duplicate_id_on="gardener", hooks_for=marked_hooks)
+    with make_worker(env, provider=p, batch_size=2, retries=0) as w:
+        stats = w.run_once()
+    assert stats.done == 1 and stats.failed == 1
+    assert hook_texts(env["db"], "gardener") == []
+    assert any("这条属于 cheap" in t for t in hook_texts(env["db"], "cheap"))
+
+
+def test_pack_id_is_the_job_id(env: dict):
+    job = enqueue(env["db"], "gardener")
+    p = FakeProvider()
+    with make_worker(env, provider=p) as w:
+        w.run_once()
+    assert p.calls[0][0]["id"] == str(job)
+
+
+# --- Mnemonic 落库口径 -------------------------------------------------------
 
 
 def test_rows_split_by_hook_type_plus_gloss_row(env: dict):
