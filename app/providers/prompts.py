@@ -8,13 +8,16 @@
   （"stakeout /ˈsteɪkaʊt/ → 死盯凯特" 是读音钩子；照着字母瞎编不算）。
 - **宁缺毋滥**：hooks 允许空数组，硬凑的联想比没有更伤记忆。
 - **没有事实区**：morph 拆分永远标"未经词源核验"，其余钩子标"非词源"。
-- 输出必须是纯 JSON 数组，长度与输入一致，顺序一一对应。
+- 输出必须是纯 JSON 数组，每个元素**原样带回输入的 id**——解析侧按 id 对位，
+  顺序没有语义（工单 6-2：曾因模型重排导致助记张冠李戴）。
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any, Sequence
+
+from app.providers import pack_id
 
 # --- system ----------------------------------------------------------------
 
@@ -24,8 +27,10 @@ SYSTEM_PROMPT = """\
 
 【铁律】
 1. 只输出 JSON 数组，不要 Markdown 代码块、不要解释、不要前后缀文字。
-2. 数组长度必须与输入条目数完全一致，顺序一一对应（第 i 个输出对应第 i 个输入）。
-3. 每个元素只有两个键：context_gloss、hooks。多一个键都算错。
+2. 数组长度必须与输入条目数完全一致，每个输入条目**必须且只能**有一个输出元素。
+3. 每个元素只有三个键：id、context_gloss、hooks。多一个键都算错。
+   **id 必须原样抄回该条目给出的 id 字符串**（一个字符都不许改、不许编、不许复用）。
+   程序按 id 对位，不看顺序；id 错了或缺了，那一条会被直接丢弃并重跑。
 4. 你**没有**陈述事实的授权：不许讲词源、不许讲"来自拉丁语/古英语…"。
    任何拆分、联想都只是记忆手段，必须带免责标签。
 
@@ -48,8 +53,8 @@ SYSTEM_PROMPT = """\
   没有 ipa、或者读音实在谐不出自然的中文，就不要给 pun。
 - 不要出现低俗、暴力、歧视内容；不要用生僻典故。
 
-【输出形状示例】（仅示形状，不要照抄内容）
-[{"context_gloss":"（这句里）临时被叫去执行的盯梢任务",
+【输出形状示例】（仅示形状，不要照抄内容；id 用该条目自己的 id）
+[{"id":"17","context_gloss":"（这句里）临时被叫去执行的盯梢任务",
   "hooks":[{"type":"morph","text":"stake 桩 + out 在外——像钉在外面的桩一样守着",
             "label":"拆分助记，未经词源核验"},
            {"type":"pun","text":"读音近「死盯凯特」——盯梢就是死盯目标",
@@ -64,12 +69,14 @@ USER_HEADER = """\
 """
 
 USER_FOOTER = """
-再说一遍：只输出 JSON 数组，长度 {n}，顺序与上面一致。\
+再说一遍：只输出 JSON 数组，长度 {n}，每个元素带上它那条的 id 原文（{ids}）。\
 """
 
 # 单条词条的渲染模板。ipa 单独一行且显式标注用途，是为了让谐音钩子有依据。
+# id 放第一行且再次点名"原样回传"——对位全靠它。
 ITEM_TEMPLATE = """\
 ### 条目 {i}
+- id: {id}          ← 输出该条目时必须原样回传这个 id
 - 词元 lemma: {lemma}
 - 台词中的形式 surface: {surface}
 - 词性 pos: {pos}
@@ -97,6 +104,7 @@ def render_item(item: dict, index: int) -> str:
     t = item.get("t")
     return ITEM_TEMPLATE.format(
         i=index,
+        id=pack_id(item),
         lemma=_fmt(item.get("lemma")),
         surface=_fmt(item.get("surface") or item.get("lemma")),
         pos=_fmt(item.get("pos")),
@@ -113,7 +121,8 @@ def build_user_prompt(batch: Sequence[dict]) -> str:
     """整批输入包 → 一条 user 消息。"""
     n = len(batch)
     body = "\n".join(render_item(item, i + 1) for i, item in enumerate(batch))
-    return USER_HEADER.format(n=n) + body + USER_FOOTER.format(n=n)
+    ids = ", ".join(f'"{pack_id(item)}"' for item in batch) or "无"
+    return USER_HEADER.format(n=n) + body + USER_FOOTER.format(n=n, ids=ids)
 
 
 # 有的接口（DeepSeek response_format=json_object）强制顶层必须是对象，

@@ -2,20 +2,25 @@
 
 一个 provider 就是两个方法：
 
-    annotate(batch: list[dict]) -> list[dict]   # 一一对应，顺序即对应关系
+    annotate(batch: list[dict]) -> list[dict]   # 按 id 对应，**顺序无语义**
     estimate_cost(batch: list[dict]) -> float   # 人民币元，只估不扣
 
 输入包（代码组装，一词一包，speaker 可空）::
 
-    {"lemma":"stakeout","surface":"stakeout","pos":"n","ipa":"ˈsteɪkaʊt",
+    {"id":"17","lemma":"stakeout","surface":"stakeout","pos":"n","ipa":"ˈsteɪkaʊt",
      "dict_gloss":"盯梢；监视","sentence":"I just got called in to a stakeout.",
      "speaker":null,"episode":"s01e01","t":12.33}
 
 输出包（强制 schema，验证失败即重试）::
 
-    {"context_gloss":"（这句里）临时被叫去执行的盯梢任务",
+    {"id":"17","context_gloss":"（这句里）临时被叫去执行的盯梢任务",
      "hooks":[{"type":"morph","text":"stake 桩 + out 在外……",
                "label":"拆分助记，未经词源核验"}]}
+
+**批量对位靠 id，不靠顺序**（工单 6-2）：模型重排数组曾导致助记张冠李戴。
+每条输入包带一个稳定 id（worker 用 AnnotationJob.id），模型必须原样回传；
+match_annotations() 按 id 匹配，缺 id / id 不在本批 / 重复 id 的元素一律丢弃，
+对应的任务留给下一轮重试。数组顺序从此没有任何语义。
 
 DESIGN §5 的硬规矩由**代码**兜底，不指望模型自觉：
 - 没有事实区（factual 已处决），morph 拆分永远带"未经核验"标签；
@@ -28,7 +33,7 @@ worker 跑 fake 时进程里没有任何 HTTP 客户端。
 
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 __all__ = [
     "Provider",
@@ -40,6 +45,9 @@ __all__ = [
     "validate_annotation",
     "enforce_labels",
     "has_disclaimer",
+    "coerce_id",
+    "pack_id",
+    "match_annotations",
     "register",
     "get_provider",
     "provider_names",
@@ -75,7 +83,8 @@ class Provider(Protocol):
     name: str
 
     def annotate(self, batch: list[dict]) -> list[dict]:
-        """一批输入包 → 一批输出包，长度与顺序必须一一对应。"""
+        """一批输入包 → 一批输出包。每个输出包必须带输入包的 id（顺序无所谓）；
+        对不上 id 的元素会被丢弃，对应任务由 worker 重试。"""
         ...
 
     def estimate_cost(self, batch: list[dict]) -> float:
@@ -89,13 +98,17 @@ class Provider(Protocol):
 # 它会直接落到 Mnemonic.kind 上，得能当键用。
 HOOK_TYPE_PATTERN = r"^[a-z][a-z0-9_]{0,23}$"
 
+# id 由代码生成（AnnotationJob.id 的十进制字符串），模型只负责原样抄回来
+ID_MAX_LEN = 64
+
 ANNOTATION_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "poi annotate output",
     "type": "object",
-    "required": ["context_gloss", "hooks"],
+    "required": ["id", "context_gloss", "hooks"],
     "additionalProperties": False,
     "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": ID_MAX_LEN},
         "context_gloss": {"type": "string", "minLength": 1, "maxLength": 400},
         "hooks": {
             "type": "array",
@@ -134,12 +147,15 @@ def _manual_validate(obj: Any) -> None:
 
     if not isinstance(obj, dict):
         raise SchemaViolation(f"顶层不是对象: {type(obj).__name__}")
-    extra = set(obj) - {"context_gloss", "hooks"}
+    extra = set(obj) - {"id", "context_gloss", "hooks"}
     if extra:
         raise SchemaViolation(f"顶层多出字段: {sorted(extra)}")
-    for key in ("context_gloss", "hooks"):
+    for key in ("id", "context_gloss", "hooks"):
         if key not in obj:
             raise SchemaViolation(f"缺字段: {key}")
+    rid = obj["id"]
+    if not isinstance(rid, str) or not 1 <= len(rid) <= ID_MAX_LEN:
+        raise SchemaViolation(f"id 必须是 1..{ID_MAX_LEN} 字的字符串")
     gloss = obj["context_gloss"]
     if not isinstance(gloss, str) or not 1 <= len(gloss) <= 400:
         raise SchemaViolation("context_gloss 必须是 1..400 字的字符串")
@@ -201,6 +217,81 @@ def enforce_labels(obj: dict) -> dict:
     out = dict(obj)
     out["hooks"] = hooks
     return out
+
+
+# --- 按 id 对位（工单 6-2：模型重排不许串词） ------------------------------
+
+
+def coerce_id(value: Any) -> str | None:
+    """把模型回传的 id 归一成字符串；归一不了返回 None（该元素作废）。
+
+    容忍模型把 "17" 写成数字 17（JSON 里两种都常见），但不容忍 1.5 / null /
+    对象这类根本对不上号的东西。
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else None
+    if isinstance(value, str):
+        s = value.strip()
+        return s if 1 <= len(s) <= ID_MAX_LEN else None
+    return None
+
+
+def pack_id(item: dict) -> str:
+    """输入包的 id。代码组装时一定会写 id；缺了就退回 lemma/surface（够稳定）。"""
+    rid = coerce_id(item.get("id"))
+    if rid is not None:
+        return rid
+    return str(item.get("lemma") or item.get("surface") or "")
+
+
+def match_annotations(
+    batch: Sequence[dict], items: Any
+) -> tuple[dict[str, dict], list[str]]:
+    """把模型输出按 id 对回输入包。返回 (id -> 校验并补标签后的输出, 问题列表)。
+
+    顺序在这里**没有任何语义**。丢弃规则（丢掉的那条 = 对应任务下轮重试）：
+    - 元素不是对象 / 缺 id / id 归一不了；
+    - id 不在本批（模型自己编的）；
+    - id 重复：前后两条至少有一条是错的，**两条都丢**，绝不赌；
+    - 过不了 ANNOTATION_SCHEMA。
+    """
+    wanted = {pack_id(i) for i in batch}
+    matched: dict[str, dict] = {}
+    poisoned: set[str] = set()
+    problems: list[str] = []
+    if not isinstance(items, list):
+        return {}, [f"输出顶层不是数组: {type(items).__name__}"]
+
+    for pos, el in enumerate(items):
+        if not isinstance(el, dict):
+            problems.append(f"[{pos}] 不是对象: {type(el).__name__}")
+            continue
+        rid = coerce_id(el.get("id"))
+        if rid is None:
+            problems.append(f"[{pos}] 缺 id 或 id 非法: {el.get('id')!r}")
+            continue
+        if rid not in wanted:
+            problems.append(f"[{pos}] id={rid!r} 不在本批")
+            continue
+        if rid in poisoned:
+            problems.append(f"[{pos}] id={rid!r} 重复（已作废）")
+            continue
+        if rid in matched:
+            del matched[rid]
+            poisoned.add(rid)
+            problems.append(f"[{pos}] id={rid!r} 重复：两条都丢弃")
+            continue
+        el = dict(el)
+        el["id"] = rid
+        try:
+            matched[rid] = enforce_labels(validate_annotation(el))
+        except SchemaViolation as exc:
+            problems.append(f"[{pos}] id={rid!r} schema: {exc}")
+    return matched, problems
 
 
 # --- 注册表 ----------------------------------------------------------------

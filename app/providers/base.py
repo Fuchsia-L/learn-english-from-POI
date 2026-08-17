@@ -21,8 +21,8 @@ from app.providers import (
     ProviderNotConfigured,
     ProviderTransientError,
     SchemaViolation,
-    enforce_labels,
-    validate_annotation,
+    match_annotations,
+    pack_id,
 )
 from app.providers.prompts import SYSTEM_PROMPT, build_user_prompt, debug_dump
 
@@ -118,6 +118,8 @@ class ChatJSONProvider:
         self._max_tokens = max_tokens
         self._sleep = sleep
         self._transport = transport
+        # 上一次 annotate() 里被丢弃的元素（缺 id / id 不在本批 / 重复 / 不合 schema）
+        self.last_problems: list[str] = []
 
     # --- 配置 --------------------------------------------------------------
 
@@ -152,6 +154,12 @@ class ChatJSONProvider:
     # --- 协议 --------------------------------------------------------------
 
     def annotate(self, batch: list[dict]) -> list[dict]:
+        """返回**按 id 对上号的那些**输出，顺序按输入排（顺序本身无语义）。
+
+        对不上的元素直接丢：条数少于输入是合法结果，剩下的任务由 worker 下一轮
+        重试（provider 自己不为部分失败重试，免得和 worker 的重试叠加烧钱）。
+        一条都对不上才抛 SchemaViolation（可重试）。
+        """
         if not batch:
             return []
         payload = self.payload(batch)
@@ -160,11 +168,14 @@ class ChatJSONProvider:
             try:
                 resp = self._post(payload)
                 items = parse_json_array(self.extract_text(resp))
-                if len(items) != len(batch):
+                matched, problems = match_annotations(batch, items)
+                if not matched:
                     raise SchemaViolation(
-                        f"输出条数 {len(items)} != 输入条数 {len(batch)}"
+                        f"{self.name}: 没有一条输出能按 id 对回输入"
+                        + ("；" + "；".join(problems[:3]) if problems else "")
                     )
-                return [enforce_labels(validate_annotation(i)) for i in items]
+                self.last_problems = problems
+                return [matched[k] for i in batch if (k := pack_id(i)) in matched]
             except (ProviderTransientError, SchemaViolation) as exc:
                 last = exc
                 if attempt < self.retries:
