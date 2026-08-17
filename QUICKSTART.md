@@ -23,16 +23,22 @@ python scripts/build_ecdict.py        # 构建本地词典 data/ecdict.db（77 �
 ## 2. 从硬字幕片源制作字幕（每集一次）
 
 ```bash
-python scripts/extract_hardsub.py 第一集.mp4 -o ep01.en.srt --boxes-json ep01.boxes.json
+python scripts/extract_hardsub.py 第一集.mp4 \
+  -o data/ep01.en.srt --boxes-json data/ep01.boxes.json
 ```
 
 默认 `--crop 1920:54:0:1026` 对准 bilibili 正版 POI 1080p；其他片源截帧调 W:H:X:Y。
 
+**srt 和 boxes 一律写到 `data/`（已被忽略）或仓库外**：`.boxes.json` 里存的是
+每个词的坐标 + 完整字幕文本，性质等同字幕原文；仓库 Public 期间字幕/媒体一概
+不入库（DESIGN §0）。`.gitignore` 已挡 `*.srt` / `*.boxes.json` / `data/`，但
+换个后缀名放到仓库根目录照样会被 `git add .` 收进去，别自己绕过去。
+
 ## 3. 入库
 
 ```bash
-python -m app.ingest ep01.en.srt --title POI --season-ep s01e01 \
-  --video 第一集.mp4 --db data/poi.db --boxes-json ep01.boxes.json
+python -m app.ingest data/ep01.en.srt --title POI --season-ep s01e01 \
+  --video 第一集.mp4 --db data/poi.db --boxes-json data/ep01.boxes.json
 ```
 
 `--video` 给视频绝对路径最稳；视频不拷贝、不上传，播放时由本地服务流式读。

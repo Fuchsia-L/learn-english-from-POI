@@ -7,7 +7,7 @@
 - [x] 硬字幕 OCR 提取 (`scripts/extract_hardsub.py`) — 已在 2 分钟 1080p 片段上验证,词级准确率 ~99.7%,全程本地零成本
 - [x] 字幕解析 / 分词 / 词元归一 (`app/ingest.py` + `app/db.py`) — srt → SQLite，token 小写归一、simplemma 词元、不排专名
 - [x] 本地词典 (`scripts/build_ecdict.py`) — ECDICT 77 万词条 → `data/ecdict.db`（音标/中文释义/考试标签/词形变换）
-- [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 字幕三档 + OCR 词框热区 + 查询卡 + 生词本侧栏
+- [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 多界面（播放 / 生词本）+ 字幕三档 + 忽略白色的自然模糊遮罩 + OCR 词框热区 + 查询卡 + 助记展示
 - [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
 - [ ] 生词本与复习
 
@@ -54,21 +54,58 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 `app/static/player.html` 一个文件：HTML+CSS+JS 全内联，无外部依赖、无 CDN、
 **不使用任何浏览器存储 API**（设置只活在 JS 变量里）。视觉是黑客终端 × POI 机器风。
 
-- **字幕三档**（快捷键 `1` / `2` / `3`，默认档 2）：
+### 多界面
+
+顶栏是终端风 tab：`[ 播放 ] [ 生词本 ]`，快捷键 `V` 循环切换，`Esc` 回播放界面。
+**播放是主界面**，其余界面全屏铺开；切走时视频自动暂停，切回来恢复原播放状态
+（切走前在播就接着播，切走前是暂停就还是暂停）。加界面只要在 JS 顶部的 `VIEWS`
+数组里加一行 + 加一个 `<section id="view-xxx" class="view">`，tab 自动长出来。
+
+- **播放界面**：视频 + 自绘控制条 + 当前段文本 + 字幕三档 + 词框热区 + 查询卡。
+- **生词本界面**：卡片栅格（`auto-fill minmax(330px,1fr)`），每张卡展开
+  词元/音标/词性/词典释义 + **AI 助记** + 全部 encounter（集数、时间、原形、原句），
+  每条 encounter 有「去这句」按钮直接跳回播放界面定位到那一秒。
+
+### 字幕三档与遮罩
+
+- **三档**（快捷键 `1` / `2` / `3`，默认档 2）：
   1. 双语：不遮挡，烧录英文行上叠透明热区；
-  2. 只遮中文：磨黑遮罩条只盖中文行（1080p 参考帧 `y∈[958,1026]`），英文原位可点；
+  2. 只遮中文：遮罩带只盖中文行（1080p 参考帧 `y∈[958,1026]`），英文原位可点；
   3. 裸听：中英全遮（`y∈[958,1080]`），无热区。
+- **遮罩不是黑条**，是"忽略白色"的自然模糊：按 `SYNC_MS` 节奏把遮罩带
+  （外加带上方 `PAD` 行——那里必定没有字，拿来当背景参考）drawImage 到一张
+  横向 1/16 降采样的小 canvas，每列取参考行的中位数作为该列背景色，
+  带内像素**与背景亮度差越大越往背景色靠**（白字、黑描边一起吃掉），
+  差得少的真画面内容原样留着；再靠 CSS 放大 + `blur` 抹平块感。
+  效果是"画面自然延续、只是没有字"。单帧处理实测约 1~2ms（1080p 源，120×22 小图）。
+- **降级链**：canvas 不可用 / 被污染 / 连续超 `BUDGET_MS` → 纯 CSS
+  `backdrop-filter: blur(18px) saturate(.9) brightness(.85)`，底色不透明度上限 `.35`
+  （这一层平时也在，垫在 canvas 底下，保证首帧解出来之前也不漏字）。
+- 强度参数全在 `CONF.MASK`：`PAD` / `DOWN_X` / `DOWN_Y` / `FLOOR` / `RANGE` /
+  `STRENGTH`。字幕残影没吃干净就调小 `FLOOR`、`RANGE`；参考行蹭到字就调大 `PAD`。
+- 视频暂停时也会在 seek / 换段 / 改档后**刷新一帧**（不是只在播放时更新）。
+
+### 热区、查询卡、助记
+
 - **热区**：词框来自 `Segment.word_boxes_json`，按 `<video>` 实际显示区域相对
   1920x1080 参考帧缩放（含 letterbox 偏移）映射成透明 `<div>`；hover 描白框，
   点击 → `GET /lookup` → 查询卡（当前形式/词元/音标/释义/原句/[加入生词本]）。
+  查询卡有 `data-state`（`loading` / `done` / `error`）当终态标志，E2E 断言等它。
+- **助记展示**（DESIGN §5）：收藏即排队，查询卡按 2s 间隔轮询
+  `GET /mnemonic?lexeme_id=`（最多 30s），`status=done` 渲染语境释义 + 各条 hook
+  （类型徽标 + **免责标签小字弱化**），`queued/running` 显示"助记生成中…"，
+  无 job 整区不显示。生词本界面打开时对每张可见卡片各拉一次（不轮询），
+  想再看新结果点「刷新」。助记拉不到永远不打断看剧（LLM 是旁路）。
 - **对齐退路**（DESIGN §4）：某段没有词框（或大面积丢框）时，档 2 自动改为
   中英全遮 + 用 `tokens_json` 在遮罩下沿自渲染一行可点击英文字幕；
   档 1 按 DESIGN 降级为仅展示不可点。个别词丢框只是那个词不可点，其余照常。
-- 其他快捷键：`v` 生词本侧栏，`Esc` 关卡/关侧栏，`空格` 播放暂停，`←/→` ±5 秒。
-- 三档坐标、退路阈值等都在 `player.html` 顶部的 `CONF` 常量里，换片源改那儿。
+- 其他快捷键：`空格` 播放暂停，`←/→` ±5 秒，`Esc` 关查询卡。
+- 三档坐标、遮罩强度、轮询节奏、退路阈值都在 `player.html` 顶部的 `CONF` 常量里。
 
 端到端用例见 `tests/test_player_e2e.py`（playwright + chromium，标记 `slow`）：
-夹具全自造（自编 srt → ingest → 手编词框 → ffmpeg lavfi 黑场视频）。
+夹具全自造（自编 srt → ingest → 手编词框 → ffmpeg lavfi `testsrc2` 彩色测试视频；
+遮罩用例要读 canvas 像素断言"不是黑条"，纯黑视频验不出来）。助记用例在测试内
+跑一轮 `fake` provider 的 worker，再断言前端轮询把内容显示出来。
 
 ```bash
 PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers playwright install chromium   # 首次

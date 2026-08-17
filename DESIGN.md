@@ -66,15 +66,24 @@ scripts/
 - `GET /vocab` → 生词本（lexeme 卡 + encounters 展开）
 - `GET /mnemonic?lexeme_id=` → done 则返回内容，否则返回 job status（前端轮询）
 
-## 4. 播放器（M0 范围）
+## 4. 播放器（v0.3：多界面结构）
 
-- <video src=/media/id> + 进度条 + 集/段选择。
+- 多界面：顶部终端风 tab 切换，播放是主界面，生词本是独立全屏界面（卡片栅格，
+  展开词典释义/助记/全部 encounter，「去这句」跳回播放定位）；结构预留继续加界面。
+  切走自动暂停，切回恢复。快捷键 v 切界面。
+- <video src=/media/id> + 自绘控制条 + 集/段选择。
 - **字幕三档**（用户定义）：
   1. **双语**：不遮烧录字幕；英文行上叠一层透明点击热区（词框来自 OCR）。
   2. **只遮中文**：遮罩条只盖中文行；英文仍是画面原字，原位可点（同热区机制）。
   3. **裸听**：中英全遮，无字幕层。
-- 热区机制：extract_hardsub 升级为同时输出 tesseract 词级包围盒 →
+- 热区机制：extract_hardsub 同时输出 tesseract 词级包围盒 →
   存 Segment.word_boxes_json → 前端按视频缩放比例映射成透明 <div> 热区。
+- 遮罩（v0.3 重做，"忽略白色"）：canvas 采样遮罩带 + 带上方无字参考行，逐列估背景色，
+  带内像素按亮度差混向背景 → 白字被吃掉、背景色调保留，暗场景近乎无痕。
+  新帧上屏才重画（requestVideoFrameCallback），杜绝 seek 脏帧缓存。
+  降级链：canvas 不可用 → CSS blur（不透明度 ≤0.35，禁止视觉黑条）。参数在 CONF.MASK。
+- 助记展示：查询卡与生词本轮询 /mnemonic（卡打开 2s 间隔上限 30s），done 渲染
+  gloss + hooks（type 徽标 + 免责标签弱化小字），annotating 显示生成中。
 - **对齐退路**（写进验收）：若热区与画面文字实测错位明显，档 2 退化为
   "中英都遮 + 自渲染可点击英文字幕"；档 1 降级为仅展示不可点。
 - 点击 → 查询卡（默认暂停，设置可关）：当前形式 / 词元 / 音标 / 词典释义 /
@@ -83,15 +92,16 @@ scripts/
 
 ## 5. annotate 契约（M1 核心，M0 只建队列）
 
-输入（代码组装，一词一包；speaker 可空——OCR 拿不到可靠说话人）：
+输入（代码组装，一词一包；speaker 可空——OCR 拿不到可靠说话人；
+id = AnnotationJob.id，批量对位的唯一依据）：
 ```json
-{"lemma":"stakeout","surface":"stakeout","pos":"n","ipa":"ˈsteɪkaʊt",
+{"id":"17","lemma":"stakeout","surface":"stakeout","pos":"n","ipa":"ˈsteɪkaʊt",
  "dict_gloss":"盯梢；监视","sentence":"I just got called in to a stakeout.",
  "speaker":null,"episode":"s0xe0x","t":12.33}
 ```
-输出（强制 JSON schema，验证失败重试）：
+输出（强制 JSON schema，验证失败重试；id 必填且原样回传）：
 ```json
-{"context_gloss":"（这句里）临时被叫去执行的盯梢任务",
+{"id":"17","context_gloss":"（这句里）临时被叫去执行的盯梢任务",
  "hooks":[
   {"type":"morph","text":"stake 桩 + out 在外——像钉在外面的桩一样守着",
    "label":"拆分助记，未经词源核验"},
@@ -105,8 +115,12 @@ scripts/
 - 按 lexeme 缓存 + 版本化；用户可编辑/重生成/删除（edited_by_user 置位后不被覆盖）。
 - provider 接口：`annotate(batch: list[dict]) -> list[dict]`；钩子生成的目标提供方是
   DeepSeek（用户后续接入），当前先用 anthropic 低档位糙跑。
+- **批量对位靠 id，不靠顺序**（工单 6-2）：数组顺序没有语义；缺 id / id 不在本批 /
+  重复 id 的元素一律丢弃，对应任务下一轮只重试没对上的那些。
 - **预热 = 预算制**：ingest 完成时把 当集 lemma ∩ cet46.txt 按词频降序入队（低优先级），
   每集预算上限默认 ¥4（配置项），估算超限即截断。点击收藏的词永远高优先级插队。
+  预算检查与费用累计发生在**每一次真实 provider 调用之前**（重试也计费，
+  否则一批重试 3 次就能把 ¥4 烧成 ¥12，工单 6-1）；高优先级不受限但费用照记。
 
 ## 6. 验收标准（主会话按此验收子代理产出）
 
