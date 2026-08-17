@@ -6,6 +6,7 @@
 <title>POI // 学词终端</title>
 <!--
   单文件播放器（DESIGN.md §4）。无外部依赖、无 CDN、无浏览器存储 API。
+  界面为多界面结构：顶部 tab 切换（播放 / 生词本 / 以后还能加），VIEWS 数组加一行即多一个界面。
   设定值全部集中在 JS 顶部的 CONF；坐标一律以 1920x1080 参考帧为准，
   渲染时按 <video> 实际显示区域（含 letterbox 偏移）换算。
 -->
@@ -59,12 +60,24 @@ header{
 .brand{color:var(--acc); font-weight:700; letter-spacing:.16em}
 .brand span{color:var(--dim); font-weight:400; letter-spacing:.02em; margin-left:6px}
 .spacer{flex:1}
+
+/* 界面切换：终端风 tab（[ 播放 ] [ 生词本 ]），加界面就在 VIEWS 里加一行 */
+#tabs{display:flex; gap:6px}
+#tabs button{
+  background:transparent; border:1px solid transparent; color:var(--dim);
+  letter-spacing:.10em; padding:4px 6px;
+}
+#tabs button:hover{color:var(--fg)}
+#tabs button.on{color:var(--acc); border-color:var(--line); background:rgba(63,240,138,.08)}
+
 .modes{display:flex; gap:0; border:1px solid var(--line); border-radius:2px; overflow:hidden}
 .modes button{border:0; border-right:1px solid var(--line); border-radius:0; background:transparent}
 .modes button:last-child{border-right:0}
 .modes button.on{background:rgba(63,240,138,.10); color:var(--acc); box-shadow:inset 0 -2px 0 var(--acc)}
 label.chk{display:flex; align-items:center; gap:6px; color:var(--dim); cursor:pointer}
 label.chk input{accent-color:var(--acc)}
+/* 播放界面专属的顶栏控件：切到别的界面就收起来 */
+body:not([data-view="play"]) .playonly{display:none}
 
 /* ---------- 状态行 ---------- */
 #statusbar{
@@ -76,8 +89,12 @@ label.chk input{accent-color:var(--acc)}
 #dot.warn{background:var(--amber); box-shadow:0 0 6px var(--amber)}
 #dot.err{background:#ff5d5d; box-shadow:0 0 6px #ff5d5d}
 
-/* ---------- 舞台 ---------- */
+/* ---------- 界面容器 ---------- */
 main{padding:16px; max-width:1680px; margin:0 auto}
+.view{display:none}
+.view.on{display:block}
+
+/* ---------- 播放界面 ---------- */
 #stage{
   position:relative; background:#000; border:1px solid var(--line);
   line-height:0;
@@ -95,15 +112,28 @@ main{padding:16px; max-width:1680px; margin:0 auto}
 #layer{position:absolute; inset:0; z-index:4; pointer-events:none}
 #layer > *{pointer-events:none}
 
-/* 遮罩条：磨黑 */
+/* 遮罩带：不是黑条。
+   canvas 档（默认）：画面降采样 + 高亮抑制后原样贴回来，只是没有字；
+   CSS 降级档：backdrop-filter 模糊，底色不透明度上限 .35（禁止黑条）。 */
 .mask{
-  position:absolute; display:none;
-  background:rgba(3,5,8,.94);
-  backdrop-filter:blur(7px) saturate(.3);
-  -webkit-backdrop-filter:blur(7px) saturate(.3);
-  border-top:1px solid rgba(255,255,255,.06);
+  position:absolute; display:none; overflow:hidden;
+  /* 底档（也是降级档）：轻模糊 + 不透明度上限 .35 的极淡底色。
+     canvas 画出来之后会把这层完全盖住；首帧解出来之前也不会漏字。 */
+  background:rgba(6,9,13,.30);
+  backdrop-filter:blur(18px) saturate(.9) brightness(.85);
+  -webkit-backdrop-filter:blur(18px) saturate(.9) brightness(.85);
 }
 .mask.on{display:block}
+.mask.cssblur{border-top:1px solid rgba(255,255,255,.05)}
+#maskcv{
+  display:block; position:absolute; left:0; width:100%;
+  /* top / height 由 JS 按取样区设（比遮罩带高出 PAD 行，多出来的被裁掉）。
+     小画布 CSS 放大（浏览器插值）+ 轻微模糊：块感抹平，像画面自然延续。 */
+  filter:blur(9px) saturate(.98);
+  transform:scaleX(1.03);       /* 横向撑一点，别让模糊在左右边缘咬出透明缝 */
+  transform-origin:center;
+}
+.mask.cssblur #maskcv{display:none}
 
 /* 词框热区：平时全透明，hover 才描白框（机器盯梢） */
 .hot{
@@ -145,10 +175,10 @@ main{padding:16px; max-width:1680px; margin:0 auto}
 #card{
   position:fixed; right:22px; bottom:22px; width:min(390px, 92vw); z-index:70;
   display:none; background:var(--panel); border:1px solid var(--line);
-  box-shadow:0 12px 40px rgba(0,0,0,.65);
+  box-shadow:0 12px 40px rgba(0,0,0,.65); max-height:86vh; overflow:auto;
 }
 #card.on{display:block}
-#card.shift{right:calc(min(390px, 92vw) + 42px)}
+body:not([data-view="play"]) #card{display:none}
 #card::before, #card::after{
   content:""; position:absolute; width:12px; height:12px; border:1px solid var(--white);
   opacity:.7; pointer-events:none;
@@ -185,85 +215,117 @@ main{padding:16px; max-width:1680px; margin:0 auto}
 #collectBtn.done{border-color:var(--line); color:var(--dim); background:transparent}
 #collectMsg{color:var(--dim); font-size:12px}
 
-/* ---------- 生词本侧栏 ---------- */
-#vocab{
-  position:fixed; top:0; right:0; bottom:0; width:min(390px, 94vw); z-index:80;
-  background:var(--panel); border-left:1px solid var(--line);
-  transform:translateX(102%); transition:transform .16s ease-out;
-  display:flex; flex-direction:column;
+/* ---------- 助记区（查询卡 / 生词本共用一套渲染） ---------- */
+.mnemo{margin-top:11px; padding-top:9px; border-top:1px dashed var(--line)}
+.mnemo[data-state="none"]{display:none; margin:0; padding:0; border:0}
+.mnemo .mhead{color:var(--dim); font-size:11px; letter-spacing:.14em; margin-bottom:6px}
+.mnemo .mgloss{color:var(--white); line-height:1.65; white-space:pre-wrap}
+.mnemo .hook{margin-top:7px; line-height:1.6}
+.mnemo .hook .badge{
+  display:inline-block; margin-right:6px; padding:0 5px;
+  border:1px solid var(--line); background:var(--panel-2);
+  color:var(--acc); font-size:11px; letter-spacing:.08em; vertical-align:1px;
 }
-#vocab.on{transform:none}
-.vhead{
-  display:flex; align-items:center; gap:8px; padding:9px 12px;
-  border-bottom:1px solid var(--line); color:var(--acc);
-  font-size:11px; letter-spacing:.14em;
+.mnemo .hook .htext{color:var(--fg); white-space:pre-wrap}
+/* 免责标签：小字弱化，在场但不抢戏 */
+.mnemo .hook .lbl{display:block; color:var(--dim); font-size:10px; opacity:.75; margin-top:1px}
+.mnemo .wait{color:var(--dim)}
+.mnemo .wait::after{content:""}
+
+/* ---------- 生词本界面（全屏） ---------- */
+#vbar{
+  display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  padding:8px 12px; border:1px solid var(--line); background:var(--panel);
+  color:var(--acc); font-size:11px; letter-spacing:.14em; margin-bottom:12px;
 }
-.vhead .x{margin-left:auto; color:var(--dim); cursor:pointer; letter-spacing:0}
-.vlist{overflow:auto; padding:10px 12px 24px}
-.vcard{border:1px solid var(--line); background:var(--panel-2); padding:10px 11px; margin-bottom:9px}
-.vcard .top{display:flex; align-items:baseline; gap:8px}
-.vcard .lm{color:var(--white); font-size:15px}
+#vbar .cnt{color:var(--dim); letter-spacing:.02em; font-size:12px}
+#vbar .spacer{flex:1}
+#vbar button{letter-spacing:.02em}
+#vlist{
+  display:grid; gap:12px;
+  grid-template-columns:repeat(auto-fill, minmax(330px, 1fr));
+  align-items:start;
+}
+.vcard{border:1px solid var(--line); background:var(--panel-2); padding:12px 13px 13px}
+.vcard .top{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap}
+.vcard .lm{color:var(--white); font-size:17px; letter-spacing:.03em}
 .vcard .ip{color:var(--amber); font-size:12px}
-.vcard .ps{color:var(--dim); font-size:11px; margin-left:auto}
-.vcard .gl{color:var(--fg); margin-top:5px; font-size:12px}
-.vcard .enc{
-  margin-top:7px; padding-top:7px; border-top:1px dashed var(--line);
-  color:var(--dim); font-size:12px; line-height:1.6;
-}
+.vcard .ps{color:var(--dim); font-size:11px}
+.vcard .n{color:var(--dim); font-size:11px; margin-left:auto}
+.vcard .gl{color:var(--fg); margin-top:6px; font-size:12px; line-height:1.6}
+.vcard .gl div{margin-bottom:2px}
+.vcard .encs{margin-top:9px; padding-top:8px; border-top:1px dashed var(--line)}
+.vcard .encs .eh{color:var(--dim); font-size:11px; letter-spacing:.14em; margin-bottom:5px}
+.vcard .enc{color:var(--dim); font-size:12px; line-height:1.65; margin-bottom:8px}
+.vcard .enc .ehead{display:flex; align-items:center; gap:8px}
+.vcard .enc .body{color:var(--fg); margin-top:1px}
 .vcard .enc em{color:var(--acc); font-style:normal}
-.empty{color:var(--dim); padding:14px 2px; line-height:1.8}
+.vcard .enc .jump{
+  margin-left:auto; flex:0 0 auto; padding:1px 6px; font-size:11px; color:var(--dim);
+  background:transparent; border:1px solid var(--line);
+}
+.vcard .enc .jump:hover{color:var(--acc); border-color:var(--acc)}
+.empty{color:var(--dim); padding:18px 2px; line-height:1.9; white-space:pre-line}
 </style>
 </head>
-<body>
+<body data-view="play">
 <div id="grain"></div>
 
 <header>
   <div class="brand">POI<span>// 学词终端</span></div>
-  <select id="ep" title="选集"><option>加载中…</option></select>
-  <div class="modes" id="modes">
+  <div id="tabs"></div>
+  <select id="ep" class="playonly" title="选集"><option>加载中…</option></select>
+  <div class="modes playonly" id="modes">
     <button data-mode="1" title="快捷键 1">1 双语</button>
     <button data-mode="2" title="快捷键 2">2 遮中文</button>
     <button data-mode="3" title="快捷键 3">3 裸听</button>
   </div>
-  <label class="chk" title="点词时是否自动暂停"><input type="checkbox" id="pauseChk" checked> 点词暂停</label>
+  <label class="chk playonly" title="点词时是否自动暂停"><input type="checkbox" id="pauseChk" checked> 点词暂停</label>
   <div class="spacer"></div>
-  <button id="vocabBtn">生词本 [V]</button>
+  <span class="k">切界面 [V]</span>
 </header>
 
 <div id="statusbar"><span id="dot"></span><span id="status">初始化…</span></div>
 
 <main>
-  <div id="stage">
-    <video id="video" playsinline preload="metadata"></video>
-    <div id="layer">
-      <div class="mask" id="mask"></div>
-      <div id="hots"></div>
-      <div id="fbline"></div>
+  <section class="view on" id="view-play">
+    <div id="stage">
+      <video id="video" playsinline preload="metadata"></video>
+      <div id="layer">
+        <div class="mask" id="mask"><canvas id="maskcv" width="8" height="4"></canvas></div>
+        <div id="hots"></div>
+        <div id="fbline"></div>
+      </div>
+      <i class="corner tl"></i><i class="corner tr"></i>
+      <i class="corner bl"></i><i class="corner br"></i>
     </div>
-    <i class="corner tl"></i><i class="corner tr"></i>
-    <i class="corner bl"></i><i class="corner br"></i>
-  </div>
 
-  <div id="controls">
-    <button id="playBtn" title="播放 / 暂停">▶ 播放</button>
-    <button id="prevSeg" title="上一段">◀ 段</button>
-    <button id="nextSeg" title="下一段">段 ▶</button>
-    <input type="range" id="seek" min="0" max="0" step="0.01" value="0" title="进度">
-    <span id="time">00:00 / 00:00</span>
-  </div>
+    <div id="controls">
+      <button id="playBtn" title="播放 / 暂停">▶ 播放</button>
+      <button id="prevSeg" title="上一段">◀ 段</button>
+      <button id="nextSeg" title="下一段">段 ▶</button>
+      <input type="range" id="seek" min="0" max="0" step="0.01" value="0" title="进度">
+      <span id="time">00:00 / 00:00</span>
+    </div>
 
-  <div id="segline"><span class="k">当前段</span> <b id="segtext">—</b></div>
+    <div id="segline"><span class="k">当前段</span> <b id="segtext">—</b></div>
+  </section>
+
+  <section class="view" id="view-vocab">
+    <div id="vbar">
+      <span>■ VOCAB // 生词本</span>
+      <span class="cnt" id="vcount">—</span>
+      <div class="spacer"></div>
+      <button id="vrefresh" title="重新拉取生词与助记">刷新</button>
+    </div>
+    <div id="vlist"></div>
+  </section>
 </main>
 
-<div id="card">
+<div id="card" data-state="idle">
   <div class="cardtop"><span>■ LOOKUP // LOCAL</span><span class="x" id="cardX">[关闭 ESC]</span></div>
   <div class="cardbody" id="cardBody"></div>
 </div>
-
-<aside id="vocab">
-  <div class="vhead"><span>■ VOCAB // 生词本</span><span class="x" id="vocabX">[关闭 V]</span></div>
-  <div class="vlist" id="vlist"></div>
-</aside>
 
 <script>
 (function(){
@@ -273,12 +335,44 @@ main{padding:16px; max-width:1680px; margin:0 auto}
 var CONF = {
   REF_W: 1920,
   REF_H: 1080,
-  CN_BAND: [958, 1026],    // 中文行（档 2 遮这里）
+  CN_BAND: [958, 1030],    // 中文行（档 2 遮这里；下沿含中文字脚，英文词框实测 1031 起）
   EN_BAND: [1026, 1080],   // 英文行（烧录字幕，热区盖这里）
   HOT_PAD: 3,              // 热区四周外扩（参考帧像素），便于点中
   BOX_MIN_RATIO: 0.5,      // 有效词框比例低于此值 → 该段走自渲染退路
-  SYNC_MS: 120             // 兜底轮询（timeupdate 约 4Hz，不够跟手）
+  SYNC_MS: 120,            // 兜底轮询（timeupdate 约 4Hz，不够跟手）
+
+  /* 遮罩：canvas 高亮抑制（"忽略白色"的自然模糊，不是黑条）。
+     取样时向带外多取 PAD 行——那几行在字幕之上、必定没有字，正好当"背景"。
+     每列取 pad 行的中位数得到该列背景色，带内像素与背景色亮度差越大
+     （白字、黑描边）越往背景色靠，差得少的（真画面内容）原样留着。
+     最后 CSS 放大 + 轻模糊 → 看起来像画面自然延续、只是没有字。
+     强度调这里：FLOOR 越小越狠，RANGE 越小越狠，STRENGTH 是总闸。 */
+  MASK: {
+    PAD: 12,         // 带外参考行（参考帧像素）
+    DOWN_X: 16,      // 横向降采样倍率（1/16）
+    DOWN_Y: 6,       // 纵向降采样倍率（带本来就矮，别降太狠）
+    MIN_W: 8, MAX_W: 320,
+    MIN_H: 5, MAX_H: 64,
+    WIN: 2,          // 背景色横向中位数窗口半径（降采样后像素）
+    FLOOR: 3,        // 与背景亮度差小于此值 = 画面内容，保留
+    RANGE: 14,       // 差值超过 FLOOR+RANGE 就整块按背景色重画
+    STRENGTH: 1.0,   // 总强度 0..1（0 = 只剩模糊）
+    BUDGET_MS: 6,    // 单帧处理耗时红线（设计目标 <3ms，留一倍余量）
+    OVER_LIMIT: 24   // 连续超红线这么多帧 → 降级到 CSS 档
+  },
+
+  /* 助记轮询（DESIGN §5：LLM 异步，前端轮询 /mnemonic） */
+  MNEMO: {
+    POLL_MS: 2000,   // 查询卡打开期间的轮询间隔
+    MAX_MS: 30000    // 最多轮询这么久，之后停手（生词本界面手动刷新）
+  }
 };
+
+/* 界面清单：加一个界面就在这儿加一行（id / 标签 / 进入时的钩子） */
+var VIEWS = [
+  { id: "play",  label: "播放" },
+  { id: "vocab", label: "生词本", enter: function(){ loadVocab(); } }
+];
 
 /* ========== 小工具 ========== */
 function $(id){ return document.getElementById(id); }
@@ -289,6 +383,7 @@ function el(tag, cls, text){
   return n;
 }
 function clear(n){ while (n.firstChild) n.removeChild(n.firstChild); }
+function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
 function fmtTime(t){
   if (!isFinite(t) || t < 0) t = 0;
   var m = Math.floor(t / 60), s = Math.floor(t % 60);
@@ -323,6 +418,10 @@ function normSurface(raw){
   return s.replace(/^["'“”‘’.,!?;:()\[\]{}…\-—–]+/, "")
           .replace(/["'“”‘’.,!?;:()\[\]{}…\-—–]+$/, "");
 }
+function playVideo(){
+  var p = video.play();
+  if (p && p.catch) p.catch(function(){});
+}
 
 /* ========== 状态 ========== */
 var S = {
@@ -334,10 +433,17 @@ var S = {
   pauseOnClick: true,    // 只存在 JS 变量里（禁用任何浏览器存储 API）
   pausedByCard: false,
   card: null,            // 当前查询卡数据
-  vocabOpen: false,
+  view: null,            // 当前界面（VIEWS 里的 id），启动时由 setView 落位
+  resumeOnReturn: false, // 离开播放界面前是否正在播（切回来恢复原状态）
   seeking: false,
   renderKey: "",
-  fallbackNoted: false
+  fallbackNoted: false,
+  maskBand: null,        // 当前遮罩带 [topRef, bottomRef]，null = 不遮
+  maskSample: null,      // 取样区 [topRef-PAD, bottomRef]（背景参考行在带外）
+  maskDirty: true,       // 有新帧/新几何待处理（只认新帧上屏，不认 currentTime）
+  mnemoTimer: null,      // 查询卡的助记轮询
+  mnemoLexeme: null,
+  vocabToken: 0          // 生词本重载令牌（防止旧请求写进新界面）
 };
 
 var video = $("video");
@@ -396,6 +502,181 @@ function usableBoxes(seg){
   return good;
 }
 
+/* ========== 遮罩：canvas 高亮抑制 ==========
+   目标是"画面自然延续、只是没有字"，不是黑条。
+   降级链：canvas 不可用 / tainted / 连续超时 → CSS backdrop-filter 档。 */
+var MK = {
+  ctx: null,           // 小画布的 2d 上下文（同时也是显示用的那张）
+  ok: true,            // false = 已降级到 CSS 档
+  inited: false,
+  over: 0,             // 连续超预算帧数
+  frames: 0,
+  lastMs: 0,
+  lastAt: 0,           // 上次成功处理的时刻（节流用）
+  avgMs: 0,
+  rvfc: false          // 是否挂上了 requestVideoFrameCallback
+};
+
+/* 什么时候该重画：只认"有新帧上屏 / 几何变了"，**不认 currentTime**。
+   seek 之后解码器往往还在吐旧帧：按 currentTime 判重会把那张脏帧永久缓存下来
+   （暗夜戏里就表现为一条亮白涂抹——白字的亮度来自另一帧）。 */
+function markMaskDirty(){ S.maskDirty = true; }
+
+/* 首选 requestVideoFrameCallback：它只在新帧真正上屏时回调，
+   播放中、暂停后 seek 都准。挂不上就靠 seek 后补几枪 + 兜底轮询。 */
+function hookVideoFrames(){
+  if (typeof video.requestVideoFrameCallback !== "function") return;
+  MK.rvfc = true;
+  var tick = function(){
+    markMaskDirty();
+    try { video.requestVideoFrameCallback(tick); } catch (e) { MK.rvfc = false; }
+  };
+  try { video.requestVideoFrameCallback(tick); } catch (e) { MK.rvfc = false; }
+}
+function scheduleMaskRefresh(){    // seek / 换源之后补画（没有 rVFC 的浏览器靠这个）
+  [120, 350, 800, 1600].forEach(function(ms){ setTimeout(markMaskDirty, ms); });
+}
+
+function degradeMask(why){
+  if (!MK.ok) return;
+  MK.ok = false;
+  $("mask").classList.add("cssblur");
+  $("maskcv").dataset.painted = "0";
+  setStatus("遮罩降级为 CSS 模糊档（" + why + "）", "warn");
+}
+
+function maskCtx(){
+  if (!MK.ok) return null;
+  if (!MK.inited) {
+    MK.inited = true;
+    try {
+      var cv = $("maskcv");
+      MK.ctx = cv.getContext("2d", { willReadFrequently: true }) || cv.getContext("2d");
+    } catch (e) { MK.ctx = null; }
+    if (!MK.ctx) { degradeMask("canvas 不可用"); return null; }
+  }
+  return MK.ctx;
+}
+
+function median(arr, n){        // 小数组插入排序取中位数（n ≤ 7）
+  for (var i = 1; i < n; i++) {
+    var v = arr[i], j = i - 1;
+    while (j >= 0 && arr[j] > v) { arr[j + 1] = arr[j]; j--; }
+    arr[j + 1] = v;
+  }
+  return arr[n >> 1];
+}
+
+/* 高亮抑制：把带内偏离"背景"的像素（白字 + 黑描边）拉回背景色。
+   背景 = 每列在带外 pad 行的中位数，再横向中位数平滑一次
+   （个别列被字戳到也不怕）。偏离小的像素是真画面，原样保留。 */
+function suppressHighlights(d, w, h, padRows){
+  var M = CONF.MASK, R = M.WIN;
+  var rows = Math.max(1, Math.min(padRows, h - 1));
+  var base = new Float32Array(w * 3);
+  var col = new Float32Array(rows);
+  var win = new Float32Array(2 * R + 1);
+  var x, c, r, k, m;
+
+  for (c = 0; c < 3; c++) {
+    for (x = 0; x < w; x++) {
+      for (r = 0; r < rows; r++) col[r] = d[(r * w + x) * 4 + c];
+      base[x * 3 + c] = median(col, rows);
+    }
+  }
+  // 横向中位数平滑（就地改会污染窗口，先复制一份）
+  var raw = base.slice();
+  for (c = 0; c < 3; c++) {
+    for (x = 0; x < w; x++) {
+      m = 0;
+      for (k = -R; k <= R; k++) {
+        var xx = x + k;
+        if (xx < 0 || xx >= w) continue;
+        win[m++] = raw[xx * 3 + c];
+      }
+      base[x * 3 + c] = median(win, m);
+    }
+  }
+
+  for (var y = 0; y < h; y++) {
+    for (x = 0; x < w; x++) {
+      var q = (y * w + x) * 4, b = x * 3;
+      var br = base[b], bg = base[b + 1], bb = base[b + 2];
+      var L = 0.299 * d[q] + 0.587 * d[q + 1] + 0.114 * d[q + 2];
+      var BL = 0.299 * br + 0.587 * bg + 0.114 * bb;
+      var a = (Math.abs(L - BL) - M.FLOOR) / M.RANGE;
+      a = (a < 0 ? 0 : (a > 1 ? 1 : a)) * M.STRENGTH;
+      if (a > 0) {
+        d[q]     = d[q]     * (1 - a) + br * a;
+        d[q + 1] = d[q + 1] * (1 - a) + bg * a;
+        d[q + 2] = d[q + 2] * (1 - a) + bb * a;
+      }
+      d[q + 3] = 255;
+    }
+  }
+}
+
+function paintMask(force){
+  var band = S.maskBand, sample = S.maskSample;
+  var cv = $("maskcv");
+  if (!band || !sample) { cv.dataset.painted = "0"; return; }
+  if (!MK.ok) return;
+  var now = (window.performance || Date).now();
+  if (!force) {
+    if (!S.maskDirty) return;                        // 没新帧就不折腾 CPU
+    if (now - MK.lastAt < CONF.SYNC_MS) return;      // 播放中按 SYNC_MS 节流
+  }
+  var vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh || video.readyState < 1) return;   // 连尺寸都没有，等下一轮
+
+  var M = CONF.MASK;
+  // 取样区 = 遮罩带 + 带上方 PAD 行（那里没有字，当背景参考；画布靠 CSS 负偏移
+  // 顶出可视区，被 .mask 的 overflow:hidden 裁掉，所以不会盖住画面）
+  var sy = clamp(sample[0] / CONF.REF_H * vh, 0, vh - 1);
+  var sh = clamp((sample[1] - sample[0]) / CONF.REF_H * vh, 1, vh - sy);
+  var w = clamp(Math.round(vw / M.DOWN_X), M.MIN_W, M.MAX_W);
+  var h = clamp(Math.round(sh / M.DOWN_Y), M.MIN_H, M.MAX_H);
+  var padRows = clamp(Math.round((band[0] - sample[0]) / (sample[1] - sample[0]) * h),
+                      1, Math.max(1, h - 2));
+
+  var ctx = maskCtx();
+  if (!ctx) return;
+  var t0 = (window.performance || Date).now();
+  try {
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    ctx.clearRect(0, 0, w, h);                // 清空 → 下面用 alpha 判断有没有真画上
+    ctx.drawImage(video, 0, sy, vw, sh, 0, 0, w, h);
+    var img = ctx.getImageData(0, 0, w, h);   // 同源视频，不会 tainted
+    // 解码器还没吐帧时 drawImage 是空操作（readyState 未必如实反映）：
+    // 画布仍然全透明 → 这一轮不算数，dirty 保持置位，下一轮再来
+    var got = false;
+    for (var i = 3; i < img.data.length; i += 4) { if (img.data[i]) { got = true; break; } }
+    if (!got) { cv.dataset.painted = "0"; return; }   // 画布已被清空，标志跟着说实话
+    suppressHighlights(img.data, w, h, padRows);
+    ctx.putImageData(img, 0, 0);
+  } catch (e) {
+    degradeMask(String((e && e.name) || e));
+    return;
+  }
+  var ms = (window.performance || Date).now() - t0;
+  MK.frames++;
+  MK.lastMs = ms;
+  // 第一帧含 JIT / 显存分配，不进均值（否则均值永远被那一下拖着）
+  if (MK.frames > 1) MK.avgMs = MK.avgMs ? MK.avgMs * 0.85 + ms * 0.15 : ms;
+  MK.lastAt = (window.performance || Date).now();
+  S.maskDirty = false;                        // 这一帧处理完了，等下一帧上屏
+  cv.dataset.painted = "1";
+  cv.dataset.frames = String(MK.frames);
+  cv.dataset.pad = String(padRows);
+
+  // 性能红线：连续超预算就降级，绝不为了好看拖垮播放
+  MK.over = ms > M.BUDGET_MS ? MK.over + 1 : 0;
+  if (MK.over >= M.OVER_LIMIT) degradeMask("单帧处理超 " + M.BUDGET_MS + "ms");
+  window.__maskStats = { frames: MK.frames, lastMs: MK.lastMs, avgMs: MK.avgMs,
+                         w: w, h: h, pad: padRows, rvfc: MK.rvfc,
+                         mode: MK.ok ? "canvas" : "css" };
+}
+
 /* ========== 渲染 ========== */
 function render(force){
   var g = stageGeom();
@@ -409,6 +690,7 @@ function render(force){
   clear(fb);
   fb.classList.remove("on");
   mask.classList.remove("on");
+  S.maskBand = null;
 
   // 档 3 是裸听：文字面板也不能漏字幕（否则遮了画面等于白遮）
   $("segtext").textContent = (!seg || S.mode === 3)
@@ -421,16 +703,24 @@ function render(force){
 
   // --- 遮罩 ---
   if (S.mode === 3) {
-    placeRef(mask, 0, CONF.CN_BAND[0], CONF.REF_W, CONF.EN_BAND[1] - CONF.CN_BAND[0], g);
-    mask.classList.add("on");
+    S.maskBand = [CONF.CN_BAND[0], CONF.EN_BAND[1]];
   } else if (S.mode === 2) {
     // 有词框：只遮中文行，英文照旧原位可点
     // 无词框（退路）：中英全遮 + 下沿自渲染可点击英文行（DESIGN §4 对齐退路）
-    var top = CONF.CN_BAND[0];
-    var bottom = fallback ? CONF.EN_BAND[1] : CONF.CN_BAND[1];
-    placeRef(mask, 0, top, CONF.REF_W, bottom - top, g);
-    mask.classList.add("on");
+    S.maskBand = [CONF.CN_BAND[0], fallback ? CONF.EN_BAND[1] : CONF.CN_BAND[1]];
   }
+  if (S.maskBand) {
+    placeRef(mask, 0, S.maskBand[0], CONF.REF_W, S.maskBand[1] - S.maskBand[0], g);
+    mask.classList.add("on");
+    // 画布比遮罩带高出 PAD 行（背景取样区），用负偏移顶上去、由遮罩裁掉
+    S.maskSample = [Math.max(0, S.maskBand[0] - CONF.MASK.PAD), S.maskBand[1]];
+    var cv = $("maskcv");
+    cv.style.top = ((S.maskSample[0] - S.maskBand[0]) * g.sy) + "px";
+    cv.style.height = ((S.maskSample[1] - S.maskSample[0]) * g.sy) + "px";
+  } else {
+    S.maskSample = null;
+  }
+  paintMask(true);
 
   // --- 热区 / 退路字幕 ---
   if (S.mode !== 3 && seg) {
@@ -507,12 +797,94 @@ function sync(){
   var i = findSegment(t);
   if (i !== S.segIndex) S.segIndex = i;
   render(false);
+  if (S.view === "play") paintMask(false);   // 没新帧时 paintMask 自己会跳过
   if (!S.seeking) {
     var dur = isFinite(video.duration) ? video.duration : 0;
     if (dur && $("seek").max != dur) $("seek").max = dur;
     $("seek").value = t;
     $("time").textContent = fmtTime(t) + " / " + fmtTime(dur);
   }
+}
+
+/* ========== 助记渲染（查询卡 / 生词本共用） ==========
+   /mnemonic 返回形状（app/server.py 实测）：
+   {lexeme_id, lemma, status: done|queued|running|failed|none,
+    mnemonics:[{id, kind, payload, provider, version, edited_by_user}], job|null}
+   kind="gloss" 的 payload 是 {text}；hook 行的 payload 是 {type, text, label}。 */
+function hookBase(kind){
+  return String(kind || "").split("#")[0];
+}
+/* 助记正文里的换行与词典释义同口径：字面两个字符 "\n" 也当换行拆
+   （dict_gloss 会被 provider 抄进 context_gloss，那个分隔符就跟着流进来）。
+   拆完用真换行拼回去，靠 CSS white-space:pre-wrap 显示。 */
+function mnemoText(s){
+  return glossLines(s).join("\n");
+}
+function paintMnemo(host, data){
+  if (!host) return;
+  clear(host);
+  var status = data && data.status ? String(data.status) : "none";
+  var state = status === "queued" || status === "running" ? "annotating" : status;
+  host.dataset.state = state;
+  if (state === "none") return;   // 无 job：整区不显示（CSS 隐藏）
+
+  host.appendChild(el("div", "mhead", "■ 助记 // AI"));
+  if (state === "annotating") {
+    host.appendChild(el("div", "wait", "助记生成中…"));
+    return;
+  }
+  if (state === "failed") {
+    host.appendChild(el("div", "notice", "助记生成失败（重跑 annotate worker 可再试）"));
+    return;
+  }
+  var rows = (data && data.mnemonics) || [];
+  var gloss = rows.filter(function(m){ return hookBase(m.kind) === "gloss"; })[0];
+  if (gloss && gloss.payload && gloss.payload.text) {
+    host.appendChild(el("div", "mgloss", mnemoText(gloss.payload.text)));
+  }
+  rows.forEach(function(m){
+    if (hookBase(m.kind) === "gloss") return;
+    var p = m.payload || {};
+    if (!p.text) return;
+    var box = el("div", "hook");
+    box.dataset.type = hookBase(p.type || m.kind);
+    box.appendChild(el("span", "badge", hookBase(p.type || m.kind)));
+    box.appendChild(el("span", "htext", mnemoText(p.text)));
+    if (p.label) box.appendChild(el("span", "lbl", mnemoText(p.label)));
+    host.appendChild(box);
+  });
+}
+
+/* 查询卡的轮询：卡开着才轮，2s 一次，最多 MAX_MS */
+function stopMnemoPoll(){
+  if (S.mnemoTimer) { clearTimeout(S.mnemoTimer); S.mnemoTimer = null; }
+  S.mnemoLexeme = null;
+}
+function startMnemoPoll(lexemeId){
+  stopMnemoPoll();
+  if (!lexemeId) return;
+  S.mnemoLexeme = lexemeId;
+  var t0 = Date.now();
+  (async function tick(){
+    if (S.mnemoLexeme !== lexemeId || !S.card) return;
+    var d = null;
+    try {
+      d = await api("/mnemonic?lexeme_id=" + encodeURIComponent(lexemeId));
+    } catch (e) {
+      d = null;   // 助记是旁路，拉不到就当没有，绝不弹错打断看剧
+    }
+    if (S.mnemoLexeme !== lexemeId || !S.card) return;
+    S.card.mnemo = d;
+    paintMnemo($("cardMnemo"), d);
+    var st = d && d.status;
+    if (st === "queued" || st === "running") {
+      if (Date.now() - t0 < CONF.MNEMO.MAX_MS) {
+        S.mnemoTimer = setTimeout(tick, CONF.MNEMO.POLL_MS);
+        return;
+      }
+    }
+    stopMnemoPoll();
+  })();
 }
 
 /* ========== 查询卡 ========== */
@@ -526,7 +898,8 @@ async function openCard(surface, seg, anchor){
   document.querySelectorAll(".hot.act").forEach(function(n){ n.classList.remove("act"); });
   if (anchor && anchor.classList.contains("hot")) anchor.classList.add("act");
 
-  S.card = { surface: norm, seg: seg, data: null, loading: true };
+  stopMnemoPoll();
+  S.card = { surface: norm, seg: seg, data: null, mnemo: null, loading: true };
   drawCard();
   try {
     var d = await api("/lookup?surface=" + encodeURIComponent(norm) +
@@ -535,6 +908,7 @@ async function openCard(surface, seg, anchor){
     S.card.data = d;
     S.card.loading = false;
     drawCard();
+    if (d.collected && d.lexeme_id) startMnemoPoll(d.lexeme_id);
   } catch (e) {
     if (!S.card) return;
     S.card.loading = false;
@@ -546,13 +920,25 @@ async function openCard(surface, seg, anchor){
 function drawCard(){
   var card = $("card"), body = $("cardBody");
   clear(body);
-  if (!S.card) { card.classList.remove("on"); return; }
+  if (!S.card) {
+    card.classList.remove("on");
+    card.dataset.state = "idle";
+    return;
+  }
   card.classList.add("on");
-  card.classList.toggle("shift", S.vocabOpen);
 
   var c = S.card, d = c.data;
-  if (c.loading) { body.appendChild(el("div", "k", "查询中…")); return; }
-  if (c.error) { body.appendChild(el("div", "notice", "查询失败：" + c.error)); return; }
+  // data-state 是卡片的终态标志：done 之后内容才齐（E2E 断言等这个）
+  if (c.loading) {
+    card.dataset.state = "loading";
+    body.appendChild(el("div", "k", "查询中…"));
+    return;
+  }
+  if (c.error) {
+    card.dataset.state = "error";
+    body.appendChild(el("div", "notice", "查询失败：" + c.error));
+    return;
+  }
 
   body.appendChild(row("当前形式", el("span", "surface", d.surface)));
   body.appendChild(row("词元", el("span", "lemma", d.lemma + (d.pos ? "  [" + d.pos + "]" : ""))));
@@ -605,6 +991,15 @@ function drawCard(){
   if (d.collected) msg.textContent = "已收";
   foot.appendChild(msg);
   body.appendChild(foot);
+
+  // 助记区：收藏过才有 job；轮询结果画在这里（无 job 时 CSS 自动隐藏）
+  var mn = el("div", "mnemo");
+  mn.id = "cardMnemo";
+  mn.dataset.state = "none";
+  body.appendChild(mn);
+  paintMnemo(mn, c.mnemo);
+
+  card.dataset.state = "done";
 }
 
 function row(label, valueNode){
@@ -635,49 +1030,66 @@ async function doCollect(){
     btn.classList.add("done");
     msg.textContent = d.created ? "已收 // 新词条" : "已收 // 第 " + d.encounters + " 次相遇";
     setStatus("已收藏 " + d.lemma, null);
-    loadVocab();
+    // 收藏即排了助记任务（DESIGN §5 高优先级插队）→ 开始轮询
+    paintMnemo($("cardMnemo"), { status: "queued", mnemonics: [] });
+    startMnemoPoll(d.lexeme_id);
   } catch (e) {
     btn.disabled = false;
     msg.textContent = "失败：" + (e.message || e);
   }
 }
 
-function closeCard(){
+function closeCard(silent){
   if (!S.card) return;
+  stopMnemoPoll();
   S.card = null;
   $("card").classList.remove("on");
+  $("card").dataset.state = "idle";
   clear($("cardBody"));
   document.querySelectorAll(".hot.act").forEach(function(n){ n.classList.remove("act"); });
   if (S.pausedByCard) {
     S.pausedByCard = false;
-    var p = video.play();
-    if (p && p.catch) p.catch(function(){});
+    if (!silent) playVideo();
   }
 }
 
-/* ========== 生词本侧栏（M0 只读） ========== */
+/* ========== 生词本界面（M0 只读 + 助记展示） ========== */
 async function loadVocab(){
-  var host = $("vlist");
+  var host = $("vlist"), token = ++S.vocabToken;
+  var d;
   try {
-    var d = await api("/vocab");
-    clear(host);
-    if (!d.count) {
-      host.appendChild(el("div", "empty", "生词本还是空的。\n在画面上点一个英文词，它就会出现在这里。"));
-      return;
-    }
-    d.vocab.forEach(function(v){ host.appendChild(vocabCard(v)); });
+    d = await api("/vocab");
   } catch (e) {
+    if (token !== S.vocabToken) return;
     clear(host);
+    $("vcount").textContent = "—";
     host.appendChild(el("div", "empty", "生词本加载失败：" + (e.message || e)));
+    return;
   }
+  if (token !== S.vocabToken) return;
+  clear(host);
+  var vocab = d.vocab || [];
+  var encs = vocab.reduce(function(a, v){ return a + (v.encounter_count || 0); }, 0);
+  $("vcount").textContent = d.count
+    ? d.count + " 词 // " + encs + " 次相遇"
+    : "空";
+  if (!d.count) {
+    host.appendChild(el("div", "empty",
+      "生词本还是空的。\n切到「播放」界面，在画面上点一个英文词并收藏，它就会出现在这里。"));
+    return;
+  }
+  vocab.forEach(function(v){ host.appendChild(vocabCard(v, token)); });
 }
 
-function vocabCard(v){
+function vocabCard(v, token){
   var c = el("div", "vcard");
+  c.dataset.lexemeId = String(v.lexeme_id);
+
   var top = el("div", "top");
   top.appendChild(el("span", "lm", v.lemma));
   if (v.ipa) top.appendChild(el("span", "ip", "/" + v.ipa + "/"));
-  top.appendChild(el("span", "ps", v.pos ? v.pos : ""));
+  if (v.pos) top.appendChild(el("span", "ps", "[" + v.pos + "]"));
+  top.appendChild(el("span", "n", (v.encounter_count || 0) + " 次相遇"));
   c.appendChild(top);
 
   var gl = el("div", "gl");
@@ -689,23 +1101,111 @@ function vocabCard(v){
   }
   c.appendChild(gl);
 
-  (v.encounters || []).forEach(function(e){
-    var box = el("div", "enc");
-    var head = (e.season_ep ? e.season_ep + " " : "") + fmtTime(e.t_start || 0);
-    box.appendChild(el("span", "k", head + " · "));
-    box.appendChild(el("em", null, e.surface));
-    box.appendChild(document.createElement("br"));
-    box.appendChild(document.createTextNode((e.sentence || "").replace(/\n/g, " ")));
+  // 助记：先按 /vocab 给的 mnemonic_status 占位，再各拉一次 /mnemonic（不轮询）
+  var mn = el("div", "mnemo");
+  mn.dataset.state = "none";
+  c.appendChild(mn);
+  var st = v.mnemonic_status || "none";
+  if (v.has_mnemonic || st !== "none") {
+    paintMnemo(mn, { status: v.has_mnemonic ? "done" : st, mnemonics: [] });
+    fetchVocabMnemo(v.lexeme_id, mn, token);
+  }
+
+  var encs = v.encounters || [];
+  if (encs.length) {
+    var box = el("div", "encs");
+    box.appendChild(el("div", "eh", "■ 相遇记录 // " + encs.length));
+    encs.forEach(function(e){
+      var line = el("div", "enc");
+      var head = el("div", "ehead");
+      head.appendChild(el("span", "meta",
+        (e.season_ep ? e.season_ep + " " : "") + fmtTime(e.t_start || 0)));
+      head.appendChild(el("em", null, e.surface));
+      if (e.content_id != null) {
+        var jump = el("button", "jump", "去这句");
+        jump.title = "跳到播放界面的这一句";
+        jump.addEventListener("click", function(ev){
+          ev.stopPropagation();
+          jumpTo(e.content_id, e.t_start || 0);
+        });
+        head.appendChild(jump);
+      }
+      line.appendChild(head);
+      line.appendChild(el("div", "body", (e.sentence || "").replace(/\n/g, " ")));
+      box.appendChild(line);
+    });
     c.appendChild(box);
-  });
+  }
   return c;
 }
 
-function setVocab(open){
-  S.vocabOpen = open;
-  $("vocab").classList.toggle("on", open);
-  $("card").classList.toggle("shift", open && !!S.card);
-  if (open) loadVocab();
+async function fetchVocabMnemo(lexemeId, host, token){
+  try {
+    var d = await api("/mnemonic?lexeme_id=" + encodeURIComponent(lexemeId));
+    if (token !== S.vocabToken) return;       // 界面已被重载，别写脏
+    paintMnemo(host, d);
+  } catch (e) { /* 助记是旁路，拉不到就保持占位 */ }
+}
+
+/* 生词本 → 播放界面的定位（换集也跟着换） */
+async function jumpTo(contentId, t){
+  setView("play");
+  try {
+    if (Number(contentId) !== Number(S.contentId)) {
+      $("ep").value = String(contentId);
+      await loadEpisode(contentId);
+    }
+    video.currentTime = Math.max(0, Number(t) || 0);
+    sync();
+  } catch (e) {
+    setStatus("跳转失败：" + (e.message || e), "err");
+  }
+}
+
+/* ========== 界面切换 ========== */
+function buildTabs(){
+  var host = $("tabs");
+  clear(host);
+  VIEWS.forEach(function(v){
+    var b = el("button", null, "[ " + v.label + " ]");
+    b.dataset.view = v.id;
+    b.title = "快捷键 V 循环切换";
+    host.appendChild(b);
+  });
+}
+
+function setView(id){
+  var target = VIEWS.filter(function(v){ return v.id === id; })[0];
+  if (!target || S.view === id) return;
+
+  if (S.view === "play") {
+    // 离开播放界面：记住播放状态并暂停（DESIGN §0 看剧是主活动，别在别的界面偷偷放）
+    S.resumeOnReturn = !video.paused;
+    video.pause();
+    closeCard(true);
+  }
+  S.view = id;
+  document.body.dataset.view = id;
+  VIEWS.forEach(function(v){
+    var node = $("view-" + v.id);
+    if (node) node.classList.toggle("on", v.id === id);   // 加 tab 忘了加 section 也不炸
+  });
+  Array.prototype.forEach.call($("tabs").children, function(b){
+    b.classList.toggle("on", b.dataset.view === id);
+  });
+
+  if (id === "play") {
+    render(true);                                  // 界面刚显示，几何要重算
+    if (S.resumeOnReturn) playVideo();             // 切回来恢复原状态
+    S.resumeOnReturn = false;
+  }
+  if (target.enter) target.enter();
+}
+
+function cycleView(){
+  var i = 0;
+  VIEWS.forEach(function(v, k){ if (v.id === S.view) i = k; });
+  setView(VIEWS[(i + 1) % VIEWS.length].id);
 }
 
 /* ========== 加载数据 ========== */
@@ -739,9 +1239,10 @@ async function loadEpisode(id){
   S.segments = (d.segments || []).slice().sort(function(a, b){ return a.t_start - b.t_start; });
   S.segIndex = -1;
   S.renderKey = "";
+  S.maskDirty = true;
   S.fallbackNoted = false;
   S.pausedByCard = false;   // 换集不要因为关卡把新片子自动播起来
-  closeCard();
+  closeCard(true);
   video.pause();
   video.src = "/media/" + id;
   video.load();
@@ -758,9 +1259,14 @@ function setMode(m){
     b.classList.toggle("on", Number(b.dataset.mode) === m);
   });
   S.fallbackNoted = false;
+  S.maskDirty = true;
   render(true);
 }
 
+$("tabs").addEventListener("click", function(ev){
+  var b = ev.target.closest("button[data-view]");
+  if (b) setView(b.dataset.view);
+});
 $("modes").addEventListener("click", function(ev){
   var b = ev.target.closest("button[data-mode]");
   if (b) setMode(Number(b.dataset.mode));
@@ -771,8 +1277,7 @@ $("ep").addEventListener("change", function(){
   });
 });
 $("pauseChk").addEventListener("change", function(){ S.pauseOnClick = $("pauseChk").checked; });
-$("vocabBtn").addEventListener("click", function(){ setVocab(!S.vocabOpen); });
-$("vocabX").addEventListener("click", function(){ setVocab(false); });
+$("vrefresh").addEventListener("click", function(){ loadVocab(); });
 $("cardX").addEventListener("click", function(ev){ ev.stopPropagation(); closeCard(); });
 
 $("playBtn").addEventListener("click", togglePlay);
@@ -823,8 +1328,15 @@ $("seek").addEventListener("change", function(){
   sync();
 });
 
-["timeupdate", "seeked", "seeking", "loadedmetadata", "durationchange", "play", "pause"]
-  .forEach(function(evt){ video.addEventListener(evt, function(){ sync(); }); });
+["timeupdate", "seeked", "seeking", "loadedmetadata", "loadeddata", "durationchange",
+ "play", "pause"].forEach(function(evt){
+  video.addEventListener(evt, function(){ markMaskDirty(); sync(); });
+});
+// seek 后解码器要过一会儿才把新帧推上屏：补几枪，别把旧帧留在遮罩里
+["seeked", "loadeddata"].forEach(function(evt){
+  video.addEventListener(evt, scheduleMaskRefresh);
+});
+hookVideoFrames();
 setInterval(sync, CONF.SYNC_MS);
 
 window.addEventListener("resize", function(){ render(true); });
@@ -834,7 +1346,7 @@ if (window.ResizeObserver) new ResizeObserver(function(){ render(true); }).obser
 document.addEventListener("click", function(ev){
   if (!S.card) return;
   if ($("card").contains(ev.target)) return;
-  if ($("vocab").contains(ev.target)) return;
+  if ($("tabs").contains(ev.target)) return;
   closeCard();
 });
 
@@ -842,12 +1354,14 @@ document.addEventListener("keydown", function(ev){
   var t = ev.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
-  if (ev.key === "1" || ev.key === "2" || ev.key === "3") { setMode(Number(ev.key)); ev.preventDefault(); }
-  else if (ev.key === "v" || ev.key === "V") { setVocab(!S.vocabOpen); ev.preventDefault(); }
+  var play = S.view === "play";
+  if (ev.key === "v" || ev.key === "V") { cycleView(); ev.preventDefault(); }
   else if (ev.key === "Escape") {
     if (S.card) closeCard();
-    else if (S.vocabOpen) setVocab(false);
+    else if (!play) setView("play");
   }
+  else if (!play) return;                          // 以下都是播放界面的键
+  else if (ev.key === "1" || ev.key === "2" || ev.key === "3") { setMode(Number(ev.key)); ev.preventDefault(); }
   else if (ev.key === " ") {
     // 焦点还在按钮上时，空格会顺带再激活那个按钮一次 → 先摘掉焦点
     if (t && t.tagName === "BUTTON") t.blur();
@@ -859,8 +1373,9 @@ document.addEventListener("keydown", function(ev){
 });
 
 /* ========== 启动 ========== */
+buildTabs();
+setView("play");
 setMode(2);           // 档 2 是默认档（DESIGN §4 核心学习模式）
-loadVocab();
 loadEpisodes().catch(function(e){
   setStatus("初始化失败：" + (e.message || e), "err");
 });
