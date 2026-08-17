@@ -525,7 +525,7 @@ def test_pack_id_is_the_job_id(env: dict):
     assert p.calls[0][0]["id"] == str(job)
 
 
-# --- Mnemonic 落库口径 -------------------------------------------------------
+# --- Mnemonic 落库口径 -----------------------------------------------------
 
 
 def test_rows_split_by_hook_type_plus_gloss_row(env: dict):
