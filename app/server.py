@@ -13,6 +13,7 @@
   （word_lower 非唯一，优先取本身就是小写的那条）。
 - 释义里的字面 "\\n" 分隔符原样吐给前端，服务端不折行。
 - ecdict.db 不存在/损坏时优雅降级：in_dict=false，不 500。
+- 连接每线程一条并登记在册，lifespan 退出时统一 close（Windows 不锁库文件）。
 """
 
 from __future__ import annotations
@@ -23,9 +24,10 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
@@ -54,40 +56,86 @@ def _now() -> str:
 
 # --- 连接管理 --------------------------------------------------------------
 # FastAPI 的同步端点跑在线程池里，sqlite3 连接不能跨线程共享 → 每线程一条。
+#
+# 每线程一条的代价：threading.local 只够本线程自己关，进程要退出时够不着别的
+# 线程那些连接 —— Windows 上就表现为 .db 文件被锁住、删不掉也重建不了（工单 6-4）。
+# 所以每开一条连接都往**显式注册表**里登记（sqlite3.Connection 不支持弱引用，
+# 只能用强引用列表；连接数上限 = 线程池大小，不会涨飞）。close_all() 时统一关掉：
+# sqlite3 允许跨线程 close，前提是连接开的时候带 check_same_thread=False。
 
 
-class Database:
+class _ConnRegistry:
+    """可枚举的连接登记簿：登记 → 统一关闭。线程安全。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._local = threading.local()
+        self._conns: list[sqlite3.Connection] = []
+
+    def _register(self, conn: sqlite3.Connection) -> sqlite3.Connection:
+        with self._lock:
+            self._conns.append(conn)
+        return conn
+
+    def close_all(self) -> int:
+        """关掉本对象开过的所有连接（含别的线程开的），返回关掉几条。
+
+        换掉 threading.local 实例本身，等于一次性丢掉**所有**线程缓存的引用；
+        之后哪个线程再来取连接都会重开一条，对象因此可以继续用。
+        """
+        with self._lock:
+            conns, self._conns = self._conns, []
+            self._local = threading.local()
+        n = 0
+        for c in conns:
+            try:
+                c.close()
+                n += 1
+            except sqlite3.Error:
+                pass
+        return n
+
+    def _cached(self) -> sqlite3.Connection | None:
+        return getattr(self._local, "conn", None)
+
+    def _cache(self, conn: sqlite3.Connection | None) -> None:
+        self._local.conn = conn
+
+
+class Database(_ConnRegistry):
     """poi.db 的每线程连接池。首次取连接时建表（幂等），import 阶段不碰磁盘。"""
 
     def __init__(self, path: str | Path) -> None:
+        super().__init__()
         self.path = Path(path)
-        self._local = threading.local()
-        self._lock = threading.Lock()
+        self._schema_lock = threading.Lock()
         self._ready = False
 
     def _ensure_schema(self) -> None:
         if self._ready:
             return
-        with self._lock:
+        with self._schema_lock:
             if not self._ready:
                 init_db(self.path).close()
                 self._ready = True
 
     def conn(self) -> sqlite3.Connection:
-        c = getattr(self._local, "conn", None)
+        c = self._cached()
         if c is None:
             self._ensure_schema()
-            c = get_conn(self.path)
-            self._local.conn = c
+            # check_same_thread=False：连接仍然只给开它的那个线程用，
+            # 放开只是为了 close_all() 能在退出时跨线程关掉它（工单 6-4）
+            c = self._register(get_conn(self.path, check_same_thread=False))
+            self._cache(c)
         return c
 
 
-class EcdictStore:
+class EcdictStore(_ConnRegistry):
     """ecdict.db 的只读查询（缺文件/坏文件 → 静默降级为「查不到」）。"""
 
     def __init__(self, path: str | Path) -> None:
+        super().__init__()
         self.path = Path(path)
-        self._local = threading.local()
 
     @property
     def available(self) -> bool:
@@ -97,7 +145,7 @@ class EcdictStore:
         if not self.path.exists():
             self._close_local()
             return None
-        c = getattr(self._local, "conn", None)
+        c = self._cached()
         if c is None:
             try:
                 c = sqlite3.connect(
@@ -106,17 +154,21 @@ class EcdictStore:
                 c.row_factory = sqlite3.Row
             except sqlite3.Error:
                 return None
-            self._local.conn = c
+            self._register(c)
+            self._cache(c)
         return c
 
     def _close_local(self) -> None:
-        c = getattr(self._local, "conn", None)
+        c = self._cached()
         if c is not None:
             try:
                 c.close()
             except sqlite3.Error:
                 pass
-            self._local.conn = None
+            with self._lock:
+                if c in self._conns:
+                    self._conns.remove(c)
+            self._cache(None)
 
     def lookup(self, word: str) -> dict[str, Any] | None:
         """按 word_lower 取一条；查不到或词典不可用返回 None。"""
@@ -348,14 +400,28 @@ def create_app(
     db_file = Path(db_path or os.environ.get("POI_DB") or DEFAULT_DB)
     ecdict_file = Path(ecdict_path or os.environ.get("POI_ECDICT") or DEFAULT_ECDICT)
 
+    # 建表在首个请求触发（Database._ensure_schema，幂等）——import 阶段不碰磁盘
+    db = Database(db_file)
+    ecdict = EcdictStore(ecdict_file)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """进程退出时把两个库的**所有线程**连接都关掉（工单 6-4）。
+
+        不关的后果在 Windows 上是实锤的：uvicorn 停了，poi.db / ecdict.db 仍被
+        锁着，用户删不掉也重建不了词典。Linux 上删得掉，但 WAL 文件照样残留。
+        """
+        yield
+        closed = db.close_all() + ecdict.close_all()
+        if closed:
+            print(f"[server] 关闭 {closed} 条 SQLite 连接", flush=True)
+
     app = FastAPI(
         title="learn-english-from-POI",
         version="0.2",
         description="本地看剧学词服务：字幕点词 → 查词 → 收藏 → 助记（DESIGN.md §3）",
+        lifespan=lifespan,
     )
-    # 建表在首个请求触发（Database._ensure_schema，幂等）——import 阶段不碰磁盘
-    db = Database(db_file)
-    ecdict = EcdictStore(ecdict_file)
     app.state.db = db
     app.state.ecdict = ecdict
     app.state.db_path = db_file

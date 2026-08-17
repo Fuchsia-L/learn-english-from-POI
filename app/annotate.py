@@ -14,13 +14,18 @@
 1. 取 queued 任务，**priority DESC, id ASC**（收藏 priority=10 插队，预热=0）；
 2. 组装输入包：lemma + ECDICT 音标/释义 + 最近一条 Encounter 的原句/时间戳/集数；
    预热词没有 encounter，退回"当集任一含该词的 Segment 原句"；
-3. 按批调 provider.annotate()，输出逐条过 JSON schema；
+   每个包带 id = AnnotationJob.id（对位靠它，见第 3 条）；
+3. 按批调 provider.annotate()，输出**按 id 对回任务**（顺序无语义），逐条过 JSON
+   schema；缺 id / id 不在本批 / 重复 id / 不合 schema 的元素丢弃，对应任务下一轮
+   只重试没对上的那些；
 4. 写 Mnemonic：context_gloss 单独一行 kind="gloss"，每个 hook 按 type 拆行存；
    version 递增；**edited_by_user=1 的那个 kind 永不覆盖**；
 5. job 置 done / failed（重试 --retries 次后仍失败才置 failed）。
 
-预算制：累计 estimate_cost 超 --budget 后，低优先级（priority < 10）任务一律
-不再送出（保持 queued，下次调高预算再跑），高优先级不受预算限制。
+预算制（工单 6-1 修）：estimate_cost 的累计与 --budget 检查发生在**每一次真实
+provider 调用之前**（重试也算钱），不是每批只查一次——否则一批重试 3 次就能把
+¥4 的预算烧成 ¥12。超限时低优先级任务原地停手、状态置回 queued 并计入
+skipped_budget；高优先级（priority >= 10）不受预算限制，但花费照记。
 
 健壮性：单个任务/单个批次炸掉只影响它自己，worker 不崩；provider 抛什么异常都接。
 本模块除 provider 外不发任何网络请求（provider=fake 时全程零网络）。
@@ -42,10 +47,8 @@ from app.db import get_conn, init_db
 from app.providers import (
     Provider,
     ProviderNotConfigured,
-    SchemaViolation,
-    enforce_labels,
     get_provider,
-    validate_annotation,
+    match_annotations,
 )
 
 # ECDICT 查询口径（word_lower + 优先本身小写那条）与 pos/释义取法只有一份实现，
@@ -87,6 +90,11 @@ class Job:
     def high(self) -> bool:
         return self.priority >= HIGH_PRIORITY
 
+    @property
+    def pack_id(self) -> str:
+        """输入/输出包的对位键。用 AnnotationJob.id：一批之内唯一、跨轮稳定。"""
+        return str(self.id)
+
 
 @dataclass
 class RunStats:
@@ -97,11 +105,17 @@ class RunStats:
     batches: int = 0
     calls: int = 0
     rows: int = 0
-    spent: float = 0.0
+    est_cost: float = 0.0  # 已花估算（元）：每次真实 provider 调用前累加，含重试
+
+    @property
+    def spent(self) -> float:
+        """est_cost 的旧名字，留着不动老调用方。"""
+        return self.est_cost
 
     def as_dict(self) -> dict:
         d = self.__dict__.copy()
-        d["spent"] = round(self.spent, 4)
+        d["est_cost"] = round(self.est_cost, 4)
+        d["spent"] = d["est_cost"]
         return d
 
 
@@ -130,13 +144,18 @@ class AnnotateWorker:
         self.retries = max(0, int(retries))
         self.limit = limit
         self.content_id = content_id
-        self.spent = 0.0  # 本次运行累计预估花费（元）
+        self.est_cost = 0.0  # 本次运行累计预估花费（元），每次真实调用前累加
         self._budget_logged = False
         self._log = log if log is not None else self._default_log
         self._sleep = sleep
         self._conn: sqlite3.Connection | None = None
 
     # --- 基础设施 ----------------------------------------------------------
+
+    @property
+    def spent(self) -> float:
+        """est_cost 的旧名字。"""
+        return self.est_cost
 
     @staticmethod
     def _default_log(msg: str) -> None:
@@ -156,9 +175,17 @@ class AnnotateWorker:
         return self._conn
 
     def close(self) -> None:
+        """关掉本 worker 开的所有 SQLite 连接（poi.db + ecdict.db）。
+
+        Windows 上没关的连接会锁住文件，害得用户删不掉/重建不了词典（工单 6-4）。
+        """
         if self._conn is not None:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
             self._conn = None
+        self.ecdict.close_all()
 
     def __enter__(self) -> "AnnotateWorker":
         return self
@@ -257,6 +284,8 @@ class AnnotateWorker:
                 self.log(f"lemma={lemma!r} 既无 encounter 也无字幕原句，裸词送模型")
 
         return {
+            # 对位键：模型必须原样回传（顺序不作数，见 providers.match_annotations）
+            "id": job.pack_id,
             "lemma": lemma,
             "surface": surface or lemma,
             "pos": fields["pos"],
@@ -357,18 +386,47 @@ class AnnotateWorker:
 
     # --- 跑一批 ------------------------------------------------------------
 
-    def process_batch(self, batch: list[Job], stats: RunStats) -> None:
-        """一批的完整生命周期：running → 调用（含重试）→ 落库 → done/failed。"""
+    def _afford(self, pending: list[Job], stats: RunStats) -> bool:
+        """这次**真实调用**掏不掏得起？掏得起就当场记账（重试也计费）。
+
+        高优先级（用户点击收藏）不受预算限制，但花费照记——否则 est_cost 会骗人。
+        """
+        est = self._estimate(pending)
+        if not any(j.high for j in pending) and self.est_cost + est > self.budget:
+            if not self._budget_logged:
+                self.log(
+                    f"预算已用尽（累计 ¥{self.est_cost:.4f} + 本次调用 ¥{est:.4f} "
+                    f"> 上限 ¥{self.budget:.2f}）：停手，剩下的低优先级任务保持 "
+                    f"queued（调高 --budget 后可继续）"
+                )
+                self._budget_logged = True
+            return False
+        self.est_cost += est
+        stats.est_cost = self.est_cost
+        return True
+
+    def process_batch(self, batch: list[Job], stats: RunStats) -> bool:
+        """一批的完整生命周期：running → 调用（含重试）→ 落库 → done/failed。
+
+        返回 True 表示**被预算卡住**了（本批没跑完的任务已置回 queued），
+        调用方应当停止再送低优先级任务。
+        """
         if not batch:
-            return
+            return False
         stats.batches += 1
         self._set_status([j.id for j in batch], "running")
 
         pending = list(batch)
         results: dict[int, dict] = {}
         last_err = ""
+        budget_stop = False
         for attempt in range(self.retries + 1):
             if not pending:
+                break
+            # 预算检查/记账必须在**每次**真实调用之前，重试也不例外（工单 6-1）
+            if not self._afford(pending, stats):
+                budget_stop = True
+                last_err = "预算用尽，未送出"
                 break
             if attempt:
                 self.log(
@@ -387,19 +445,29 @@ class AnnotateWorker:
                 last_err = f"{type(exc).__name__}: {exc}"
                 self.log(f"provider 调用失败：{last_err}")
                 continue
-            if not isinstance(outs, list) or len(outs) != len(pending):
-                last_err = f"输出条数 {len(outs) if isinstance(outs, list) else '?'} != {len(pending)}"
-                self.log(f"provider 输出条数不符：{last_err}")
-                continue
+            # 按 id 对位，不看顺序（工单 6-2：模型重排过就会张冠李戴）
+            matched, problems = match_annotations([j.pack for j in pending], outs)
+            if problems:
+                last_err = "；".join(problems[:3])
+                self.log(f"丢弃 {len(problems)} 个对不上的输出元素：{last_err[:200]}")
             still: list[Job] = []
-            for job, out in zip(pending, outs):
-                try:
-                    results[job.id] = enforce_labels(validate_annotation(out))
-                except SchemaViolation as exc:
-                    last_err = f"schema: {exc}"
-                    self.log(f"lemma={job.lemma!r} 输出不合 schema：{exc}")
+            for job in pending:
+                out = matched.get(job.pack_id)
+                if out is None:
                     still.append(job)
+                else:
+                    results[job.id] = out
+            if not matched and not problems:
+                last_err = "provider 返回了空数组"
+                self.log(f"provider 没吐出任何元素：{[j.lemma for j in pending]}")
             pending = still
+
+        skipped: list[Job] = []
+        if budget_stop and pending:
+            skipped = list(pending)
+            self._set_status([j.id for j in skipped], "queued")
+            stats.skipped_budget += len(skipped)
+            self.log(f"预算截断：{[j.lemma for j in skipped]} 放回队列")
 
         ok_ids: list[int] = []
         for job in batch:
@@ -415,13 +483,15 @@ class AnnotateWorker:
             ok_ids.append(job.id)
             self.log(f"lemma={job.lemma!r} -> done（{n} 行，version 见库）")
 
-        failed = [j for j in batch if j.id not in ok_ids]
+        skipped_ids = {j.id for j in skipped}
+        failed = [j for j in batch if j.id not in ok_ids and j.id not in skipped_ids]
         self._set_status(ok_ids, "done")
         self._set_status([j.id for j in failed], "failed")
         stats.done += len(ok_ids)
         stats.failed += len(failed)
         for j in failed:
             self.log(f"lemma={j.lemma!r} -> failed（{last_err[:160] or '未知原因'}）")
+        return budget_stop
 
     # --- 跑一轮 ------------------------------------------------------------
 
@@ -461,33 +531,22 @@ class AnnotateWorker:
         high = self._prepare([j for j in jobs if j.high], stats)
         low = self._prepare([j for j in jobs if not j.high], stats)
 
-        # 高优先级（用户点击收藏的词）不受预算限制，永远先跑
+        # 高优先级（用户点击收藏的词）不受预算限制，永远先跑（花费仍然记账）
         for i in range(0, len(high), self.batch_size):
-            batch = high[i : i + self.batch_size]
-            self.spent += self._estimate(batch)
-            stats.spent = self.spent
-            self.process_batch(batch, stats)
+            self.process_batch(high[i : i + self.batch_size], stats)
 
-        # 低优先级（预热）按预算截断
+        # 低优先级（预热）按预算截断。截断判定在 process_batch 里逐次调用做，
+        # 这里只负责收摊：剩下的批次一个都不送，全部保持 queued。
         for i in range(0, len(low), self.batch_size):
             batch = low[i : i + self.batch_size]
-            est = self._estimate(batch)
-            if self.spent + est > self.budget:
-                remaining = len(low) - i
-                stats.skipped_budget += remaining
-                if not self._budget_logged:
-                    self.log(
-                        f"预算已用尽（累计 ¥{self.spent:.4f} + 本批 ¥{est:.4f} "
-                        f"> 上限 ¥{self.budget:.2f}）：跳过 {remaining} 个低优先级任务"
-                        f"（保持 queued，调高 --budget 后可继续）"
-                    )
-                    self._budget_logged = True
+            if self.process_batch(batch, stats):
+                rest = low[i + len(batch) :]
+                if rest:
+                    stats.skipped_budget += len(rest)
+                    self.log(f"预算截断：还有 {len(rest)} 个低优先级任务保持 queued")
                 break
-            self.spent += est
-            stats.spent = self.spent
-            self.process_batch(batch, stats)
 
-        stats.spent = self.spent
+        stats.est_cost = self.est_cost
         return stats
 
     def run_loop(self, poll: float = DEFAULT_POLL, max_rounds: int | None = None) -> RunStats:
@@ -505,7 +564,7 @@ class AnnotateWorker:
                 total.batches += s.batches
                 total.calls += s.calls
                 total.rows += s.rows
-                total.spent = self.spent
+                total.est_cost = self.est_cost
                 if s.done == 0 and s.failed == 0:
                     self._sleep(poll)
         except KeyboardInterrupt:
@@ -622,7 +681,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"[annotate] done={d['done']} failed={d['failed']} "
         f"skipped_budget={d['skipped_budget']} rows={d['rows']} "
-        f"calls={d['calls']} 预估花费 ¥{d['spent']}"
+        f"calls={d['calls']} est_cost=¥{d['est_cost']}（预算 ¥{args.budget:.2f}，"
+        f"含重试的每次调用都计费）"
     )
     return 0
 

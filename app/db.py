@@ -127,15 +127,19 @@ TABLES = (
 )
 
 
-def get_conn(path: PathLike) -> sqlite3.Connection:
+def get_conn(path: PathLike, check_same_thread: bool = True) -> sqlite3.Connection:
     """打开数据库连接：行按名取、外键开启、WAL。
 
     不建表——建表走 init_db()。
+
+    check_same_thread=False 只给"每线程一条连接 + 退出时统一 close"的场景用
+    （app/server.py 的 Database）：sqlite3 不允许跨线程 close 一条 check 打开的
+    连接，而进程退出必须能关掉所有线程的连接，否则 Windows 上 .db 文件被锁死。
     """
     p = Path(path)
     if p.parent and str(p.parent) not in ("", "."):
         p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p))
+    conn = sqlite3.connect(str(p), check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     if str(p) != ":memory:":
