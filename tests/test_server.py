@@ -675,3 +675,74 @@ def test_no_socket_usage(client: TestClient, env: dict, monkeypatch):
     assert client.post("/collect", json={"surface": "home", "segment_id": seg}).status_code == 200
     assert client.get("/vocab").status_code == 200
     assert client.get(f"/media/{env['content_id']}", headers={"Range": "bytes=0-10"}).status_code == 206
+
+
+# --- lifespan 关连接（工单 6-4） --------------------------------------------
+
+
+def test_lifespan_closes_every_thread_connection(env: dict):
+    """TestClient 退出后：两个库的所有连接（含线程池里那些）必须已经关掉。
+
+    Windows 上没关的连接会锁住 .db 文件，用户删不掉也重建不了词典。
+    Linux 删得掉，所以这里直接验"连接已关"这个因，顺带验文件能删（果）。
+    """
+    app = create_app(db_path=env["db"], ecdict_path=env["ecdict"])
+    db, ecdict = app.state.db, app.state.ecdict
+    with TestClient(app) as c:
+        seg = first_segment_id(c, env["content_id"])
+        assert c.get("/lookup", params={"surface": "cousins"}).status_code == 200
+        assert c.post(
+            "/collect", json={"surface": "cousins", "segment_id": seg}
+        ).status_code == 200
+        # 端点跑在线程池线程里：这些连接不是主线程开的，正是老实现关不掉的那些
+        alive = list(db._conns) + list(ecdict._conns)
+        assert len(alive) >= 2, "至少该有 poi.db + ecdict.db 各一条连接"
+
+    for conn in alive:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+    assert db._conns == [] and ecdict._conns == []
+
+    # 文件（含 WAL / SHM 残留）都能删掉
+    for p in (env["db"], env["ecdict"]):
+        for suffix in ("", "-wal", "-shm"):
+            f = Path(str(p) + suffix)
+            if f.exists():
+                f.unlink()
+    assert not env["db"].exists() and not env["ecdict"].exists()
+
+
+def test_store_reopens_after_close_all(env: dict):
+    """close_all 之后对象还能继续用（重开新连接），不是一次性的。"""
+    app = create_app(db_path=env["db"], ecdict_path=env["ecdict"])
+    with TestClient(app) as c:
+        assert c.get("/episodes").status_code == 200
+    with TestClient(app) as c:  # 第二次进出：连接重开，端点照常
+        assert c.get("/episodes").status_code == 200
+        assert c.get("/lookup", params={"surface": "cousins"}).json()["in_dict"] is True
+
+
+def test_close_all_is_idempotent(env: dict):
+    app = create_app(db_path=env["db"], ecdict_path=env["ecdict"])
+    db = app.state.db
+    with TestClient(app) as c:
+        c.get("/episodes")
+    assert db.close_all() == 0  # 已经关干净了，再关一次不炸也不重复计数
+
+
+def test_annotate_worker_closes_ecdict_too(env: dict):
+    """worker 的 EcdictStore 也归 worker.close() 管（同一个锁文件问题）。"""
+    from app.annotate import AnnotateWorker
+    from app.providers.fake import FakeProvider
+
+    w = AnnotateWorker(
+        db_path=env["db"], provider=FakeProvider(), ecdict_path=env["ecdict"],
+        log=lambda _m: None,
+    )
+    w.conn.execute("SELECT 1")
+    w.ecdict.lookup("cousin")
+    conns = [w._conn, *w.ecdict._conns]
+    w.close()
+    for conn in conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
