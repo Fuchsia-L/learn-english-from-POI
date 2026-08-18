@@ -34,6 +34,34 @@ python scripts/extract_hardsub.py 第一集.mp4 \
 不入库（DESIGN §0）。`.gitignore` 已挡 `*.srt` / `*.boxes.json` / `data/`，但
 换个后缀名放到仓库根目录照样会被 `git add .` 收进去，别自己绕过去。
 
+### 素材音轨（片子没声音时看这里）
+
+网上下到的片源常常是**只有视频、没有音轨**的默片——DASH 流把视频和音频拆成两个文件，
+只拿了视频流就是这个结果。先自检：
+
+```bash
+ffprobe -v error -show_entries stream=codec_type,codec_name \
+  -of default=noprint_wrappers=1 你的视频.mp4
+```
+
+输出里只有 `codec_type=video`、没有 `codec_type=audio`，就是缺音轨。
+
+修法：下载时选"含音轨"的档，或者把**视频流和音频流两个文件分别拿到**（下载工具随你），
+然后合成一个文件：
+
+```bash
+ffmpeg -i 视频流.m4s -i 音频流.m4s -c copy 合并后.mp4
+```
+
+`-c copy` 只封装不重编码，画质无损、几秒钟就完事；输入是 `.m4s` 还是 `.mp4` 后缀都行。
+
+另外：浏览器对 AV1 解码支持不一（旧版本/无硬解的机器可能黑屏或卡死）。播放器里只有声音
+没画面、或者一片黑，就转成 H.264 再试：
+
+```bash
+ffmpeg -i 合并后.mp4 -c:v libx264 -crf 20 -preset veryfast -c:a copy 兼容版.mp4
+```
+
 ## 3. 入库
 
 ```bash

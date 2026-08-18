@@ -512,6 +512,36 @@ def test_click_pauses_and_escape_resumes_playback(player):
     assert player.evaluate("document.getElementById('video').paused") is False
 
 
+def test_space_toggles_play_after_seekbar_drag(player):
+    """拖过进度条之后，空格还得是播放/暂停（焦点留在 <input type=range> 上的坑）。"""
+    goto_segment(player, 1)
+    box = player.locator("#seek").bounding_box()
+    y = box["y"] + box["height"] / 2
+    player.mouse.move(box["x"] + box["width"] * 0.08, y)
+    player.mouse.down()                                  # 真实拖动：焦点会落到滑块上
+    player.mouse.move(box["x"] + box["width"] * 0.20, y, steps=8)
+    player.mouse.up()
+    player.wait_for_function("() => document.getElementById('video').currentTime > 0.5")
+    # 拖完焦点必须交还，别让滑块继续截快捷键
+    player.wait_for_function("() => document.activeElement.id !== 'seek'")
+
+    player.evaluate("document.getElementById('video').play()")
+    player.wait_for_function("() => !document.getElementById('video').paused")
+    player.keyboard.press(" ")                           # 拖动之后：空格 → 暂停
+    player.wait_for_function("() => document.getElementById('video').paused")
+    player.keyboard.press(" ")                           # 再按 → 恢复播放
+    player.wait_for_function("() => !document.getElementById('video').paused")
+
+    # 焦点被强行留在滑块上（Tab 过去也是这样）时，空格同样要生效
+    player.focus("#seek")
+    assert player.evaluate("document.activeElement.id") == "seek"
+    player.keyboard.press(" ")
+    player.wait_for_function("() => document.getElementById('video').paused")
+    player.keyboard.press(" ")
+    player.wait_for_function("() => !document.getElementById('video').paused")
+    player.evaluate("document.getElementById('video').pause()")
+
+
 def test_click_outside_card_closes_it(player):
     goto_segment(player, 2)
     open_card(player, "#hots .hot[data-surface='cousin']")
@@ -533,7 +563,7 @@ def test_view_tabs_switch_and_video_state_is_restored(player):
     set_view(player, "vocab")                       # 切走：自动暂停
     assert player.locator("#view-play").is_hidden()
     assert player.evaluate("document.getElementById('video').paused") is True
-    # 生词本界面是全屏的，播放界面的顶栏控件跟着收起
+    # 生词本界面是全屏的，播放界面的顶栏控件跟着收起来
     assert player.locator("#modes").is_hidden()
     assert player.locator("#ep").is_hidden()
 
