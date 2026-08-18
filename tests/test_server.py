@@ -358,13 +358,20 @@ def test_lookup_word_outside_this_episode(client: TestClient):
     conn.close()
 
 
-def test_lookup_backfills_lexeme_cache(client: TestClient, env: dict):
+def test_lookup_backfills_lexeme_cache(env: dict):
+    """本用例要删词典文件，所以不用 client 夹具：TestClient 必须先退出。
+
+    Windows 上没关掉的 sqlite 连接会锁住 ecdict.db，unlink 直接 PermissionError
+    （工单 8c-3）。退出 with 块触发 lifespan 关闭 → EcdictStore.close_all()。
+    """
+    app = create_app(db_path=env["db"], ecdict_path=env["ecdict"])
     conn = sqlite3.connect(str(env["db"]))
     conn.row_factory = sqlite3.Row
     before = conn.execute("SELECT * FROM Lexeme WHERE lemma='home'").fetchone()
     assert before["ipa"] is None and before["dict_gloss"] is None  # ingest 只建骨架
 
-    client.get("/lookup", params={"surface": "home"})
+    with TestClient(app) as c:
+        c.get("/lookup", params={"surface": "home"})
 
     after = conn.execute("SELECT * FROM Lexeme WHERE lemma='home'").fetchone()
     assert after["ipa"] == "həʊm"
@@ -373,7 +380,8 @@ def test_lookup_backfills_lexeme_cache(client: TestClient, env: dict):
 
     # 缓存生效：词典文件消失后仍然能查到，且 in_dict 保持 true
     env["ecdict"].unlink()
-    body = client.get("/lookup", params={"surface": "home"}).json()
+    with TestClient(app) as c:
+        body = c.get("/lookup", params={"surface": "home"}).json()
     assert body["in_dict"] is True
     assert body["ipa"] == "həʊm"
 
