@@ -1,43 +1,49 @@
-"""M1 复习最小闭环的规则与查询（DESIGN §7「最近几天滚动 + 会/不会」）。
+"""M1 复习闭环的规则与查询（DESIGN §7「会/不会 + 间隔重复简化版」）。
 
 **不做 FSRS**，不碰 LLM，不 import fastapi：纯 SQLite + 标准库，
 HTTP 壳子在 app/server.py（`/review/next`、`/review/answer`、`/review/stats`）。
 
 口径（全部写成本模块顶部的常量，改规则只改常量）:
 
-1. 进队（due）—— 三个条件全满足：
-   a. 还没毕业；
-   b. 今天（UTC 日）还没复习过（ONCE_PER_DAY）；
-   c. `added_at` 在最近 REVIEW_WINDOW_DAYS 天内 **或** 历史上答过 "dont"。
-      —— 出过错的词一直跟着你，直到毕业为止；没出过错的词滚出 7 天窗口就自然沉底。
-2. 排序：从未复习过的最优先，其次「上次复习时间最早」优先；
-   同档按 added_at 早、id 小排（稳定，不随机）。
-3. 毕业：末尾**连续** GRADUATE_STREAK 次 "know"，且最后一次复习距首次收藏
-   ≥ GRADUATE_MIN_AGE_DAYS 天。毕业后不再进队（stats 里单独计数）。
-   —— 用「最后一次复习时间」而非 now 判年龄：当天收藏、当天连点两次 know
-   不算毕业，必须真的隔几天还认得。
-4. 答题幂等：同一天（UTC 日）对同一个词重复提交**同一个** result 不再插行，
+1. stage —— 每个 VocabEntry 的熟练档位，**不建列**，由 Review 事件流按时间顺序
+   重放推导（事件溯源：库里只有"什么时候答了什么"，别的都是读侧算出来的；
+   老库不需要迁移，规则一改，历史自动按新规则重推）：
+       know → stage + 1（封顶 GRADUATE_STAGE）；dont → stage 归 0。
+2. 到期日 next_due（UTC 日历日，日粒度）：
+   - 从没复习过 → 收藏当天即到期（新收藏当天就能复习）；
+   - 最后一次答 know（stage = s ≥ 1）→ 最后一次复习那天 + INTERVALS[s-1]；
+   - 最后一次答 dont（stage = 0）→ 最后一次复习那天 + DONT_INTERVAL_DAYS（明天再来）。
+3. 毕业：stage 达到 GRADUATE_STAGE = 3（3 次封顶——原片里本来就会再遇见它两次，
+   不用把词卡在队列里刷到天荒地老）。毕业后不再进队（stats 里单独计数）。
+4. 进队（due）—— 三个条件全满足：还没毕业；next_due ≤ 今天；今天（UTC 日）
+   还没复习过（ONCE_PER_DAY）。
+5. 排序：逾期最久的（next_due 最早）优先，其次从未复习过的优先，
+   再按 added_at 早、id 小排（稳定，不随机）。
+6. 答题幂等：同一天（UTC 日）对同一个词重复提交**同一个** result 不再插行，
    返回 `duplicate=true`（防手抖/刷新重放）；同一天改答另一个 result 会插行
-   （用户改口是真实信息，连击 streak 按最新一行算）。
+   （用户改口是真实信息，stage 按事件流最新一行算）。
 
 时间一律 UTC ISO8601（`2026-08-18T04:05:06+00:00`，秒级），与 server/annotate 的
-`_now()` 同款；解析时兼容不带时区的老行（按 UTC 解释）。
+`_now()` 同款；解析时兼容不带时区的老行（按 UTC 解释）。next_due 是**日期**
+（`2026-08-19`），不是时刻——复习按天走，不按小时走。
 """
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 
 from app.db import ENCOUNTER_SELECT, encounter_view
 
-# --- 规则常量（DESIGN §7：M1 先滚动 + 会/不会，FSRS 以后再说） --------------
+# --- 规则常量（DESIGN §7：间隔重复简化版，FSRS 以后再说） ------------------
 
-REVIEW_WINDOW_DAYS = 7  # 「最近几天滚动」的 N：added_at 在这个窗口内就进队
-GRADUATE_STREAK = 2  # 连续几次 "know" 算毕业
-GRADUATE_MIN_AGE_DAYS = 3  # 且最后一次复习距首次收藏至少几天
+# 答对之后隔多少天再问一遍：stage 1 → 1 天，stage 2 → 3 天，stage 3 → 毕业。
+# 想把封顶提到 4 次，就在这里续一个数（GRADUATE_STAGE 跟着长）。
+INTERVALS = (1, 3, 7)
+GRADUATE_STAGE = len(INTERVALS)  # stage 到这个档 = 毕业（3 次封顶）
+DONT_INTERVAL_DAYS = 1  # 答"不会"：stage 归 0，明天再来
 ONCE_PER_DAY = True  # 同一 UTC 日已复习过的词，今天不再出现
 
 RESULT_KNOW = "know"
@@ -51,15 +57,29 @@ MAX_LIMIT = 200
 def rules() -> dict[str, Any]:
     """当前规则口径，随 API 一起吐出去（前端/报告不用猜常量值）。"""
     return {
-        "window_days": REVIEW_WINDOW_DAYS,
-        "graduate_streak": GRADUATE_STREAK,
-        "graduate_min_age_days": GRADUATE_MIN_AGE_DAYS,
+        "intervals": list(INTERVALS),
+        "graduate_stage": GRADUATE_STAGE,
+        "dont_interval_days": DONT_INTERVAL_DAYS,
         "once_per_day": ONCE_PER_DAY,
         "results": list(RESULTS),
     }
 
 
-# --- 时间 ------------------------------------------------------------------
+def interval_days(stage: int) -> int:
+    """stage → 距下次到期的天数。stage 0（刚答错/新词）走 DONT_INTERVAL_DAYS。"""
+    if stage <= 0:
+        return DONT_INTERVAL_DAYS
+    return INTERVALS[min(stage, len(INTERVALS)) - 1]
+
+
+def next_stage(stage: int, result: str) -> int:
+    """事件流的状态转移：know 进一档（封顶），dont 归零。"""
+    if result == RESULT_KNOW:
+        return min(stage + 1, GRADUATE_STAGE)
+    return 0
+
+
+# --- 时间 --------------------------------------------------------------
 
 
 def now_utc() -> datetime:
@@ -91,12 +111,6 @@ def utc_date(dt: datetime | None) -> date | None:
     return dt.astimezone(timezone.utc).date() if dt is not None else None
 
 
-def _days_between(later: datetime | None, earlier: datetime | None) -> float | None:
-    if later is None or earlier is None:
-        return None
-    return (later - earlier).total_seconds() / 86400.0
-
-
 # --- 状态 ------------------------------------------------------------------
 
 
@@ -113,6 +127,9 @@ class EntryState:
     added_at: str
     note: str | None
     reviews: int = 0
+    stage: int = 0
+    next_due: str | None = None  # UTC 日历日，ISO date（"2026-08-19"）
+    overdue_days: int = 0  # 今天 - next_due（负数 = 还没到期）
     know_streak: int = 0
     last_at: str | None = None
     last_result: str | None = None
@@ -133,6 +150,9 @@ class EntryState:
             "added_at": self.added_at,
             "note": self.note,
             "reviews": self.reviews,
+            "stage": self.stage,
+            "next_due": self.next_due,
+            "overdue_days": self.overdue_days,
             "know_streak": self.know_streak,
             "last_reviewed_at": self.last_at,
             "last_result": self.last_result,
@@ -166,33 +186,42 @@ def _apply_history(
     state: EntryState, history: Sequence[tuple[str, str]], now: datetime
 ) -> None:
     today = utc_date(now)
+    assert today is not None
     state.reviews = len(history)
     state.ever_dont = any(res == RESULT_DONT for _at, res in history)
     if history:
         state.last_at, state.last_result = history[-1]
-    streak = 0
+    streak = 0  # 老字段：不再参与调度，只是给界面/报告看的"当前连对几次"
     for _at, res in reversed(history):
         if res != RESULT_KNOW:
             break
         streak += 1
     state.know_streak = streak
 
+    # stage：把 Review 事件流从头重放一遍（老库不迁移，改规则即重推导）
+    stage = 0
+    for _at, res in history:
+        stage = next_stage(stage, res)
+    state.stage = stage
+    state.graduated = stage >= GRADUATE_STAGE
+
     last_dt = parse_ts(state.last_at)
     state.reviewed_today = any(utc_date(parse_ts(at)) == today for at, _res in history)
 
-    age = _days_between(last_dt, state._added_dt)
-    state.graduated = bool(
-        streak >= GRADUATE_STREAK and age is not None and age >= GRADUATE_MIN_AGE_DAYS
-    )
+    # next_due：复习过就从"最后一次复习那天"起算间隔；
+    # 没复习过（或时间戳是脏数据解不出来）就按收藏当天到期——宁可多复习一次，不丢词。
+    last_day = utc_date(last_dt)
+    if last_day is not None:
+        due_day = last_day + timedelta(days=interval_days(stage))
+    else:
+        due_day = utc_date(state._added_dt) or today
+    state.next_due = due_day.isoformat()
+    state.overdue_days = (today - due_day).days
 
-    # 「最近 N 天滚动」按 wall-clock 算：now - added_at ≤ N 天。
-    # added_at 解析不出来（脏数据）时按「在窗口内」处理——宁可多复习一次，不丢词。
-    added_age = _days_between(now, state._added_dt)
-    in_window = added_age is None or added_age <= REVIEW_WINDOW_DAYS
     state.due = bool(
         not state.graduated
+        and due_day <= today
         and not (ONCE_PER_DAY and state.reviewed_today)
-        and (in_window or state.ever_dont)
     )
 
 
@@ -221,12 +250,11 @@ def entry_states(
 
 
 def _sort_key(st: EntryState) -> tuple:
-    """从未复习的最优先，其次上次复习时间最早的优先；同档按收藏早、id 小。"""
-    last = parse_ts(st.last_at)
+    """逾期最久的最优先，其次从未复习的优先；同档按收藏早、id 小（稳定，不随机）。"""
     added = st._added_dt
     return (
-        1 if last is not None else 0,  # 从未复习 → 0，排最前
-        last.timestamp() if last is not None else 0.0,
+        st.next_due or "",  # ISO date 的字典序 == 日期序：最早到期 = 逾期最久
+        1 if st.last_at is not None else 0,  # 从未复习 → 0，排前面
         added.timestamp() if added is not None else 0.0,
         st.id,
     )
@@ -404,6 +432,8 @@ def answer(
             {
                 "lemma": state.lemma,
                 "reviews": state.reviews,
+                "stage": state.stage,
+                "next_due": state.next_due,
                 "know_streak": state.know_streak,
                 "graduated": state.graduated,
                 "due": state.due,
@@ -417,7 +447,7 @@ def answer(
 
 
 def stats(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
-    """今日已复习 / 待复习 / 毕业总数（UTC 日历日）。"""
+    """今日已复习 / 待复习 / 毕业总数 + stage 分布（UTC 日历日）。"""
     now = now or now_utc()
     today = utc_date(now)
     assert today is not None
@@ -432,6 +462,12 @@ def stats(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, An
         elif r["result"] == RESULT_DONT:
             dont_today += 1
 
+    # stage 分布：0..GRADUATE_STAGE 全给出来（没人的档也要有 0，前端不用补键）。
+    # 顶档 == 毕业档，和 graduated 是同一批词。
+    stage_counts = {str(i): 0 for i in range(GRADUATE_STAGE + 1)}
+    for s in states:
+        stage_counts[str(min(s.stage, GRADUATE_STAGE))] += 1
+
     return {
         "date": today.isoformat(),
         "reviewed_today": sum(1 for s in states if s.reviewed_today),
@@ -440,6 +476,7 @@ def stats(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, An
         "due": sum(1 for s in states if s.due),
         "graduated": sum(1 for s in states if s.graduated),
         "total": len(states),
+        "stages": stage_counts,
         "rules": rules(),
     }
 
