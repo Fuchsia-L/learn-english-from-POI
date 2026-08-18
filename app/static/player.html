@@ -634,7 +634,7 @@ function paintMask(force){
 
   var M = CONF.MASK;
   // 取样区 = 遮罩带 + 带上方 PAD 行（那里没有字，当背景参考；画布靠 CSS 负偏移
-  // 顶出可视区，被 .mask 的 overflow:hidden 裁掉，所以不会盖住画面）
+  // 顶出可见区，被 .mask 的 overflow:hidden 裁掉，所以不会盖住画面）
   var sy = clamp(sample[0] / CONF.REF_H * vh, 0, vh - 1);
   var sh = clamp((sample[1] - sample[0]) / CONF.REF_H * vh, 1, vh - sy);
   var w = clamp(Math.round(vw / M.DOWN_X), M.MIN_W, M.MAX_W);
@@ -1329,6 +1329,11 @@ $("seek").addEventListener("change", function(){
   video.currentTime = Number($("seek").value);
   S.seeking = false;
   sync();
+  $("seek").blur();     // 拖完就把焦点还回去，别让滑块继续截快捷键
+});
+// 拖动结束（包括没改动值、不会触发 change 的那种点按）也要交还焦点
+["pointerup", "pointercancel"].forEach(function(evt){
+  $("seek").addEventListener(evt, function(){ $("seek").blur(); });
 });
 
 ["timeupdate", "seeked", "seeking", "loadedmetadata", "loadeddata", "durationchange",
@@ -1355,7 +1360,12 @@ document.addEventListener("click", function(ev){
 
 document.addEventListener("keydown", function(ev){
   var t = ev.target;
-  if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+  // 输入类控件里不抢键（含以后新加的输入框：默认按"要打字"处理）。
+  // 例外只有 <input type=range>（进度条）：它不吃字符，拖完焦点还留在上面，
+  // 再吞掉空格就成了"拖一下进度条播放暂停失灵"。
+  var isRange = !!t && t.tagName === "INPUT" && t.type === "range";
+  if (t && !isRange && (t.tagName === "INPUT" || t.tagName === "SELECT" ||
+                        t.tagName === "TEXTAREA" || t.isContentEditable)) return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
   var play = S.view === "play";
   if (ev.key === "v" || ev.key === "V") { cycleView(); ev.preventDefault(); }
@@ -1366,13 +1376,20 @@ document.addEventListener("keydown", function(ev){
   else if (!play) return;                          // 以下都是播放界面的键
   else if (ev.key === "1" || ev.key === "2" || ev.key === "3") { setMode(Number(ev.key)); ev.preventDefault(); }
   else if (ev.key === " ") {
-    // 焦点还在按钮上时，空格会顺带再激活那个按钮一次 → 先摘掉焦点
-    if (t && t.tagName === "BUTTON") t.blur();
+    // 焦点还在按钮/进度条上时，空格会顺带再激活那个控件一次 → 先摘掉焦点
+    if (t && (t.tagName === "BUTTON" || isRange)) t.blur();
     togglePlay();
     ev.preventDefault();
   }
-  else if (ev.key === "ArrowLeft") { video.currentTime = Math.max(0, video.currentTime - 5); }
-  else if (ev.key === "ArrowRight") { video.currentTime = video.currentTime + 5; }
+  // ← → 一律 ±5s；进度条聚焦时也压掉它自带的 step 微调（step=0.01，没用）
+  else if (ev.key === "ArrowLeft") {
+    video.currentTime = Math.max(0, video.currentTime - 5);
+    if (isRange) ev.preventDefault();
+  }
+  else if (ev.key === "ArrowRight") {
+    video.currentTime = video.currentTime + 5;
+    if (isRange) ev.preventDefault();
+  }
 });
 
 /* ========== 启动 ========== */
