@@ -102,6 +102,29 @@ def job_status(db: Path, job_id: int) -> sqlite3.Row:
     return row
 
 
+class BrokenEstimate:
+    """估价坏掉的 provider（工单 8b 的靶子）。
+
+    annotate() 一旦被调用就是 bug —— 估价不可用时一次真实调用都不该发出去。
+    """
+
+    name = "broken-estimate"
+
+    def __init__(self, value=0.0, raises: Exception | None = None) -> None:
+        self.value = value
+        self.raises = raises
+        self.calls = 0
+
+    def annotate(self, batch):  # pragma: no cover - 被调用即测试失败
+        self.calls += 1
+        raise AssertionError("估价不可用时绝不许调 provider（会真花钱）")
+
+    def estimate_cost(self, batch):
+        if self.raises is not None:
+            raise self.raises
+        return self.value
+
+
 def mnemonic_rows(db: Path, lexeme_id: int) -> list[sqlite3.Row]:
     conn = get_conn(db)
     rows = conn.execute(
@@ -314,6 +337,105 @@ def test_every_retry_is_charged(env: dict):
     assert stats.as_dict()["est_cost"] == pytest.approx(1.0)
 
 
+def test_estimate_broken_stops_the_round_and_keeps_jobs_queued(env: dict, logs: list):
+    """工单 8b：估价坏掉 → 停手，绝不按 ¥0 继续跑。"""
+    for lemma in ("gardener", "cheap", "nobody"):
+        enqueue(env["db"], lemma, priority=0)
+    p = BrokenEstimate(raises=RuntimeError("估价服务 500"))
+    with make_worker(env, provider=p, batch_size=1, budget=100.0, logs=logs) as w:
+        stats = w.run_once()
+
+    assert p.calls == 0                    # 一次 provider 调用都没发
+    assert stats.calls == 0
+    assert stats.done == 0 and stats.failed == 0
+    assert stats.est_cost == 0.0           # 不是"按 0 记账继续跑"，是根本没跑
+    assert stats.estimate_broken is True
+    assert stats.skipped_estimate == 3
+    assert any("估价不可用" in m for m in logs)
+
+    conn = get_conn(env["db"])
+    left = conn.execute(
+        "SELECT COUNT(*) c FROM AnnotationJob WHERE status = 'queued'"
+    ).fetchone()["c"]
+    conn.close()
+    assert left == 3                       # 全部保持 queued，等人来修
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"raises": RuntimeError("boom")},
+        {"raises": ValueError("坏掉了")},
+        {"value": None},
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": -1.0},
+        {"value": "免费啦"},
+    ],
+    ids=["raise", "raise-value", "none", "nan", "inf", "negative", "not-a-number"],
+)
+def test_estimate_bad_values_all_fail_closed(env: dict, kwargs, logs: list):
+    """异常 / None / NaN / inf / 负数 / 非数字，一律停手，不许当 ¥0。"""
+    job = enqueue(env["db"], "gardener", priority=0)
+    p = BrokenEstimate(**kwargs)
+    with make_worker(env, provider=p, batch_size=1, budget=100.0, logs=logs) as w:
+        stats = w.run_once()
+    assert p.calls == 0 and stats.calls == 0 and stats.est_cost == 0.0
+    assert stats.estimate_broken is True and stats.skipped_estimate == 1
+    assert job_status(env["db"], job)["status"] == "queued"
+
+
+def test_estimate_broken_stops_high_priority_too(client: TestClient, env: dict, logs: list):
+    """估价系统坏了就是坏了：点击收藏的高优先级任务同样一分钱不花（工单 8b）。"""
+    collect(client, "cameras", seg_id(client, env["content_id"], idx=2))
+    enqueue(env["db"], "gardener", priority=0)
+    p = BrokenEstimate(raises=RuntimeError("估价服务 500"))
+    with make_worker(env, provider=p, batch_size=1, budget=100.0, logs=logs) as w:
+        stats = w.run_once()
+
+    assert p.calls == 0 and stats.calls == 0 and stats.done == 0 and stats.failed == 0
+    assert stats.estimate_broken is True and stats.skipped_estimate == 2
+    conn = get_conn(env["db"])
+    rows = conn.execute("SELECT status FROM AnnotationJob").fetchall()
+    conn.close()
+    assert [r["status"] for r in rows] == ["queued", "queued"]
+    assert any("估价不可用" in m for m in logs)
+
+
+def test_estimate_broken_exits_loop_instead_of_spinning(env: dict):
+    """--loop 遇到估价坏掉不该无限空转刷屏，直接退出让人来修。"""
+    enqueue(env["db"], "gardener", priority=0)
+    p = BrokenEstimate(raises=RuntimeError("boom"))
+    with make_worker(env, provider=p, batch_size=1) as w:
+        total = w.run_loop(poll=0.0, max_rounds=50)
+    assert total.estimate_broken is True and total.batches == 1 and p.calls == 0
+
+
+def test_cli_returns_exit_code_3_when_estimate_broken(env: dict, monkeypatch, capsys):
+    monkeypatch.setattr(
+        A, "build_provider", lambda *_a, **_k: BrokenEstimate(raises=RuntimeError("x"))
+    )
+    enqueue(env["db"], "gardener", priority=0)
+    rc = A.main(["--db", str(env["db"]), "--ecdict", str(env["ecdict"]), "--once"])
+    out = capsys.readouterr().out
+    assert rc == A.EXIT_ESTIMATE_BROKEN == 3
+    assert "估价不可用" in out and "skipped_estimate=1" in out
+
+
+def test_dry_run_reports_estimate_failure_instead_of_zero(env: dict, monkeypatch, capsys):
+    """dry-run 也不许报一个假的 ¥0：说不知道就是不知道。"""
+    monkeypatch.setattr(
+        A, "build_provider", lambda *_a, **_k: BrokenEstimate(value=float("nan"))
+    )
+    enqueue(env["db"], "gardener", priority=0)
+    rc = A.main(
+        ["--db", str(env["db"]), "--ecdict", str(env["ecdict"]), "--dry-run"]
+    )
+    out = capsys.readouterr().out
+    assert rc == A.EXIT_ESTIMATE_BROKEN
+    assert "估价不可用" in out and "¥0" not in out
+
+
 def test_budget_stops_mid_batch_retry_and_requeues(env: dict, logs: list):
     """预算在重试中途用尽：该任务放回 queued，不是 failed。"""
     job = enqueue(env["db"], "gardener")
@@ -393,7 +515,7 @@ def test_worker_survives_arbitrary_provider_exception(env: dict):
             raise RuntimeError("provider 内部爆炸")
 
         def estimate_cost(self, batch):
-            raise RuntimeError("估价也爆炸")
+            return 0.0  # 估价正常，炸的是 annotate（估价坏掉另见 fail-closed 用例）
 
     enqueue(env["db"], "gardener")
     with make_worker(env, provider=Exploding(), retries=1) as w:
@@ -691,3 +813,31 @@ def test_build_provider_disables_inner_retries_for_real_providers(monkeypatch):
     p = A.build_provider("deepseek")
     assert p.retries == 0  # 重试归 worker 管，不叠加烧钱
     assert A.build_provider("fake").name == "fake"
+
+
+def test_build_provider_passes_model_through(monkeypatch):
+    """--model 透传（工单 8a）。构造不发网络、不校验 key。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    assert A.build_provider("deepseek").model == "deepseek-v4-flash"
+    assert A.build_provider("deepseek", "deepseek-v4").model == "deepseek-v4"
+    # fake 不认 model 参数：只能忽略，不许炸
+    assert A.build_provider("fake", "deepseek-v4").name == "fake"
+
+
+def test_cli_model_flag_reaches_build_provider(env: dict, monkeypatch, capsys):
+    """--model 从命令行一路走到 build_provider（跑的仍然是 fake，零真实调用）。"""
+    seen: dict = {}
+    real = A.build_provider
+
+    def spy(name, model=None):
+        seen["name"], seen["model"] = name, model
+        return real("fake")
+
+    monkeypatch.setattr(A, "build_provider", spy)
+    enqueue(env["db"], "gardener")
+    rc = A.main([
+        "--db", str(env["db"]), "--ecdict", str(env["ecdict"]),
+        "--provider", "deepseek", "--model", "deepseek-v4-flash-2512", "--once",
+    ])
+    assert rc == 0
+    assert seen == {"name": "deepseek", "model": "deepseek-v4-flash-2512"}
