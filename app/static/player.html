@@ -261,6 +261,8 @@ body:not([data-view="play"]) #card{display:none}
 .vcard .encs .eh{color:var(--dim); font-size:11px; letter-spacing:.14em; margin-bottom:5px}
 .vcard .enc{color:var(--dim); font-size:12px; line-height:1.65; margin-bottom:8px}
 .vcard .enc .ehead{display:flex; align-items:center; gap:8px}
+/* 网页来源的标题可以很长：截断，别把 surface 挤出卡片（工单 11） */
+.vcard .enc .ehead .meta{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .vcard .enc .body{color:var(--fg); margin-top:1px}
 .vcard .enc em{color:var(--acc); font-style:normal}
 .vcard .enc .jump{
@@ -407,7 +409,7 @@ async function api(path, opts){
   }
   return r.json();
 }
-/* 词典释义里的分隔符是字面两个字符 "\n"（见 build_ecdict._clean_text），
+/* 词典释义里的分隔符是字面两个字符 "\\n"（见 build_ecdict._clean_text），
    顺手也吃真换行。 */
 function glossLines(g){
   return String(g == null ? "" : g).split(/\\n|\n/)
@@ -1121,10 +1123,16 @@ function vocabCard(v, token){
     encs.forEach(function(e){
       var line = el("div", "enc");
       var head = el("div", "ehead");
-      head.appendChild(el("span", "meta",
-        (e.season_ep ? e.season_ep + " " : "") + fmtTime(e.t_start || 0)));
+      // 相遇来源两种（工单 11）：字幕段给「集数 + 时间码 + 去这句」，
+      // 网页划词给「🌐 页面标题」——网页没有时间轴，跳不回去也不该有按钮。
+      var web = e.source_kind === "web";
+      var meta = el("span", "meta", web
+        ? "🌐 " + (e.title || e.url || "网页")
+        : (e.season_ep ? e.season_ep + " " : "") + fmtTime(e.t_start || 0));
+      if (web && e.url) meta.title = e.url;
+      head.appendChild(meta);
       head.appendChild(el("em", null, e.surface));
-      if (e.content_id != null) {
+      if (!web && e.content_id != null) {
         var jump = el("button", "jump", "去这句");
         jump.title = "跳到播放界面的这一句";
         jump.addEventListener("click", function(ev){
