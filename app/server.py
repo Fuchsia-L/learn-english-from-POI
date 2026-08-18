@@ -9,11 +9,14 @@
 - surface 一律小写归一（ingest.normalize_surface），WordForm 主键即小写 surface。
 - Lexeme 是客观词典缓存：ingest 只建骨架行（pos/ipa/dict_gloss 为 NULL），
   首次 /lookup 或 /collect 时从 ecdict.db 回填。
-- ecdict 查询口径：`WHERE word_lower = ? ORDER BY (word = word_lower) DESC LIMIT 1`
-  （word_lower 非唯一，优先取本身就是小写的那条）。
+- ECDICT 查询/回填口径住在 **app/ecdict.py**（工单 9 抽层）：server 与 annotate
+  worker 共用同一份实现，worker 不再反向依赖 web 层。
 - 释义里的字面 "\\n" 分隔符原样吐给前端，服务端不折行。
 - ecdict.db 不存在/损坏时优雅降级：in_dict=false，不 500。
-- 连接每线程一条并登记在册，lifespan 退出时统一 close（Windows 不锁库文件）。
+- 连接每线程一条并登记在册（app/db.py 的 Database/ConnRegistry），
+  lifespan 退出时统一 close（Windows 不锁库文件）。
+- 复习闭环（M1）：规则与 SQL 住在 **app/review.py**（纯 SQLite），本模块只做
+  HTTP 壳子 —— /review/next、/review/answer、/review/stats。
 """
 
 from __future__ import annotations
@@ -23,7 +26,6 @@ import mimetypes
 import os
 import re
 import sqlite3
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,243 +36,28 @@ from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.db import init_db, get_conn
+from app import review as review_rules
+from app.consts import COLLECT_JOB_PRIORITY, DEFAULT_DB, DEFAULT_ECDICT
+from app.db import Database
+from app.ecdict import EcdictStore, fill_from_ecdict
 from app.ingest import lemmatize, normalize_surface
-
-DEFAULT_DB = "data/poi.db"
-DEFAULT_ECDICT = "data/ecdict.db"
-
-# 收藏触发的助记任务优先级（预热任务用 0，见 DESIGN §5 预算制）
-COLLECT_JOB_PRIORITY = 10
 
 MEDIA_CHUNK = 64 * 1024
 # 单 Range：`bytes=0-1023` / `bytes=1024-` / `bytes=-500`；多 Range 只取第一段
 _RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*(?:,.*)?$", re.IGNORECASE)
-# ECDICT 的 pos 列形如 "n:53/v:47"
-_POS_RATIO_RE = re.compile(r"^([a-z]+):(\d+)$")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --- 连接管理 --------------------------------------------------------------
-# FastAPI 的同步端点跑在线程池里，sqlite3 连接不能跨线程共享 → 每线程一条。
-#
-# 每线程一条的代价：threading.local 只够本线程自己关，进程要退出时够不着别的
-# 线程那些连接 —— Windows 上就表现为 .db 文件被锁住、删不掉也重建不了（工单 6-4）。
-# 所以每开一条连接都往**显式注册表**里登记（sqlite3.Connection 不支持弱引用，
-# 只能用强引用列表；连接数上限 = 线程池大小，不会涨飞）。close_all() 时统一关掉：
-# sqlite3 允许跨线程 close，前提是连接开的时候带 check_same_thread=False。
-
-
-class _ConnRegistry:
-    """可枚举的连接登记簿：登记 → 统一关闭。线程安全。"""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._local = threading.local()
-        self._conns: list[sqlite3.Connection] = []
-
-    def _register(self, conn: sqlite3.Connection) -> sqlite3.Connection:
-        with self._lock:
-            self._conns.append(conn)
-        return conn
-
-    def close_all(self) -> int:
-        """关掉本对象开过的所有连接（含别的线程开的），返回关掉几条。
-
-        换掉 threading.local 实例本身，等于一次性丢掉**所有**线程缓存的引用；
-        之后哪个线程再来取连接都会重开一条，对象因此可以继续用。
-        """
-        with self._lock:
-            conns, self._conns = self._conns, []
-            self._local = threading.local()
-        n = 0
-        for c in conns:
-            try:
-                c.close()
-                n += 1
-            except sqlite3.Error:
-                pass
-        return n
-
-    def _cached(self) -> sqlite3.Connection | None:
-        return getattr(self._local, "conn", None)
-
-    def _cache(self, conn: sqlite3.Connection | None) -> None:
-        self._local.conn = conn
-
-
-class Database(_ConnRegistry):
-    """poi.db 的每线程连接池。首次取连接时建表（幂等），import 阶段不碰磁盘。"""
-
-    def __init__(self, path: str | Path) -> None:
-        super().__init__()
-        self.path = Path(path)
-        self._schema_lock = threading.Lock()
-        self._ready = False
-
-    def _ensure_schema(self) -> None:
-        if self._ready:
-            return
-        with self._schema_lock:
-            if not self._ready:
-                init_db(self.path).close()
-                self._ready = True
-
-    def conn(self) -> sqlite3.Connection:
-        c = self._cached()
-        if c is None:
-            self._ensure_schema()
-            # check_same_thread=False：连接仍然只给开它的那个线程用，
-            # 放开只是为了 close_all() 能在退出时跨线程关掉它（工单 6-4）
-            c = self._register(get_conn(self.path, check_same_thread=False))
-            self._cache(c)
-        return c
-
-
-class EcdictStore(_ConnRegistry):
-    """ecdict.db 的只读查询（缺文件/坏文件 → 静默降级为「查不到」）。"""
-
-    def __init__(self, path: str | Path) -> None:
-        super().__init__()
-        self.path = Path(path)
-
-    @property
-    def available(self) -> bool:
-        return self.path.exists()
-
-    def _conn(self) -> sqlite3.Connection | None:
-        if not self.path.exists():
-            self._close_local()
-            return None
-        c = self._cached()
-        if c is None:
-            try:
-                c = sqlite3.connect(
-                    f"file:{self.path}?mode=ro", uri=True, check_same_thread=False
-                )
-                c.row_factory = sqlite3.Row
-            except sqlite3.Error:
-                return None
-            self._register(c)
-            self._cache(c)
-        return c
-
-    def _close_local(self) -> None:
-        c = self._cached()
-        if c is not None:
-            try:
-                c.close()
-            except sqlite3.Error:
-                pass
-            with self._lock:
-                if c in self._conns:
-                    self._conns.remove(c)
-            self._cache(None)
-
-    def lookup(self, word: str) -> dict[str, Any] | None:
-        """按 word_lower 取一条；查不到或词典不可用返回 None。"""
-        if not word:
-            return None
-        c = self._conn()
-        if c is None:
-            return None
-        try:
-            row = c.execute(
-                "SELECT word, phonetic, definition, translation, pos, tag, collins "
-                "FROM ecdict WHERE word_lower = ? "
-                "ORDER BY (word = word_lower) DESC LIMIT 1",
-                (word.lower(),),
-            ).fetchone()
-        except sqlite3.Error:
-            # 文件被换掉/损坏：丢弃连接，下次重开
-            self._close_local()
-            return None
-        return dict(row) if row is not None else None
-
-
-def _dominant_pos(raw: str | None) -> str | None:
-    """ECDICT 的 pos 列 'n:53/v:47' → 'n'；mini 夹具的 'n.' → 'n'。"""
-    if not raw:
-        return None
-    best, best_ratio = None, -1
-    for part in str(raw).split("/"):
-        m = _POS_RATIO_RE.match(part.strip().lower())
-        if m and int(m.group(2)) > best_ratio:
-            best, best_ratio = m.group(1), int(m.group(2))
-    if best:
-        return best
-    return str(raw).strip().rstrip(".").lower() or None
-
-
-def _gloss_of(row: dict[str, Any]) -> str | None:
-    """中文释义优先，退回英文释义。字面 '\\n' 分隔符原样保留。"""
-    return row.get("translation") or row.get("definition") or None
-
-
-# --- Lexeme 词典字段回填 ---------------------------------------------------
+# --- Lexeme 词典字段回填（口径见 app/ecdict.py） ---------------------------
 
 
 def _lexeme_row(conn: sqlite3.Connection, lexeme_id: int) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT id, lemma, pos, ipa, dict_gloss FROM Lexeme WHERE id = ?", (lexeme_id,)
     ).fetchone()
-
-
-def _needs_dict_fill(row: Any) -> bool:
-    return row is None or row["dict_gloss"] is None or row["ipa"] is None
-
-
-def _fill_from_ecdict(
-    conn: sqlite3.Connection | None,
-    ecdict: EcdictStore,
-    lexeme: sqlite3.Row | None,
-    lemma: str,
-    surface: str,
-) -> tuple[dict[str, Any], bool]:
-    """返回 (词典字段, in_dict)。
-
-    命中优先级：lemma → surface（'cousins' 没收录但 'cousin' 收录，反之亦然）。
-    lexeme 非空且 conn 非空时把结果回填进 Lexeme 缓存（只填 NULL 字段，不覆盖已有值）。
-    """
-    fields: dict[str, Any] = {
-        "pos": lexeme["pos"] if lexeme is not None else None,
-        "ipa": lexeme["ipa"] if lexeme is not None else None,
-        "dict_gloss": lexeme["dict_gloss"] if lexeme is not None else None,
-    }
-    cached = fields["dict_gloss"] is not None
-    if not _needs_dict_fill(lexeme):
-        return fields, True
-
-    row = ecdict.lookup(lemma)
-    if row is None and surface != lemma:
-        row = ecdict.lookup(surface)
-    if row is None:
-        # 词典未收录（专名？）；已有缓存释义仍算 in_dict
-        return fields, cached
-
-    fetched = {
-        "pos": _dominant_pos(row.get("pos")),
-        "ipa": row.get("phonetic") or None,
-        "dict_gloss": _gloss_of(row),
-    }
-    for key, val in fetched.items():
-        if fields[key] is None and val is not None:
-            fields[key] = val
-
-    if lexeme is not None and conn is not None:
-        try:
-            with conn:
-                conn.execute(
-                    "UPDATE Lexeme SET pos = COALESCE(pos, ?), ipa = COALESCE(ipa, ?),"
-                    " dict_gloss = COALESCE(dict_gloss, ?) WHERE id = ?",
-                    (fetched["pos"], fetched["ipa"], fetched["dict_gloss"], lexeme["id"]),
-                )
-        except sqlite3.Error:
-            pass  # 缓存回填失败不影响本次查词
-    return fields, True
 
 
 def _resolve_surface(
@@ -389,7 +176,15 @@ class CollectIn(BaseModel):
     note: str | None = None
 
 
-# --- 应用 ------------------------------------------------------------------
+class ReviewAnswerIn(BaseModel):
+    """POST /review/answer 的请求体。result 的合法值校验放在 app/review.py
+    （规则归规则层），这里只要求非空字符串 —— 非法值回 400 而不是 422。"""
+
+    vocab_entry_id: int = Field(..., ge=1)
+    result: str = Field(..., min_length=1)
+
+
+# --- 应用 -------------------------------------------------------------------
 
 
 def create_app(
@@ -573,7 +368,7 @@ def create_app(
             sentence = seg["text_en"]
 
         lemma, lexeme = _resolve_surface(conn, norm)
-        fields, in_dict = _fill_from_ecdict(conn, ecdict, lexeme, lemma, norm)
+        fields, in_dict = fill_from_ecdict(conn, ecdict, lexeme, lemma, norm)
         lexeme_id = int(lexeme["id"]) if lexeme is not None else None
         return {
             "surface": norm,
@@ -669,7 +464,7 @@ def create_app(
 
         # 收藏时顺手把词典字段补上，生词本立刻能显示释义
         lexeme_row = _lexeme_row(conn, lexeme_id)
-        fields, in_dict = _fill_from_ecdict(conn, ecdict, lexeme_row, lemma, norm)
+        fields, in_dict = fill_from_ecdict(conn, ecdict, lexeme_row, lemma, norm)
         n_enc = conn.execute(
             "SELECT COUNT(*) c FROM Encounter WHERE vocab_entry_id = ?",
             (vocab_entry_id,),
@@ -812,6 +607,33 @@ def create_app(
             "mnemonics": list(latest.values()),
             "job": dict(job) if job is not None else None,
         }
+
+    # ---- 复习闭环（M1，规则见 app/review.py） -----------------------------
+
+    @app.get("/review/next")
+    def review_next(
+        limit: int = Query(review_rules.DEFAULT_LIMIT, ge=1, le=review_rules.MAX_LIMIT),
+    ) -> dict:
+        """今日待复习卡（含 remaining：整个队列还剩多少，不受 limit 影响）。"""
+        return review_rules.next_cards(db.conn(), limit=limit)
+
+    @app.post("/review/answer")
+    def review_answer(payload: ReviewAnswerIn = Body(...)) -> dict:
+        """记一次「会 / 不会」。当天重复提交同一答案幂等（duplicate=true）。"""
+        conn = db.conn()
+        try:
+            return review_rules.answer(
+                conn, payload.vocab_entry_id, payload.result
+            )
+        except review_rules.BadResult as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except review_rules.UnknownEntry as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/review/stats")
+    def review_stats() -> dict:
+        """今日已复习 / 待复习 / 毕业总数（UTC 日历日）。"""
+        return review_rules.stats(db.conn())
 
     return app
 
