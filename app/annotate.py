@@ -13,7 +13,7 @@
 流程（一批一批来）:
 1. 取 queued 任务，**priority DESC, id ASC**（收藏 priority=10 插队，预热=0）；
 2. 组装输入包：lemma + ECDICT 音标/释义 + 最近一条 Encounter 的原句/时间戳/集数；
-   预热词没有 encounter，退回“当集任一含该词的 Segment 原句”；
+   预热词没有 encounter，退回"当集任一含该词的 Segment 原句"；
    每个包带 id = AnnotationJob.id（对位靠它，见第 3 条）；
 3. 按批调 provider.annotate()，输出**按 id 对回任务**（顺序无语义），逐条过 JSON
    schema；缺 id / id 不在本批 / 重复 id / 不合 schema 的元素丢弃，对应任务下一轮
@@ -29,7 +29,7 @@ skipped_budget；高优先级（priority >= 10）不受预算限制，但花费�
 
 估价 fail closed（工单 8b）：provider.estimate_cost 抛异常 / 返回 None / NaN /
 inf / 负数时，**本轮立即停手**——任务保持（或放回）queued，一次 provider 调用
-都不发，日志写明原因，进程退出码 3。不许再像以前那样“估价失败按 ¥0 处理”然后
+都不发，日志写明原因，进程退出码 3。不许再像以前那样"估价失败按 ¥0 处理"然后
 照跑不误。高优先级（点击收藏）同样停：估价系统坏了就是坏了，不确定成本时
 一分钱都不许花。
 
@@ -562,7 +562,7 @@ class AnnotateWorker:
         """估价，**fail closed**（工单 8b）。
 
         estimate_cost 抛异常 / 返回 None / NaN / inf / 负数 → 抛 EstimateUnavailable。
-        以前这里 return 0.0，等于“估价系统坏了就当免费”，能让一整轮任务按 ¥0 跑
+        以前这里 return 0.0，等于"估价系统坏了就当免费"，能让一整轮任务按 ¥0 跑
         进真 API。现在不确定成本时一分钱都不花。
         """
         try:
@@ -657,7 +657,7 @@ class AnnotateWorker:
                 total.rows += s.rows
                 total.est_cost = self.est_cost
                 if s.estimate_broken:
-                    # 估价坏了不是“等一等就好”的事，接着轮询只会刷屏。退出让人来修。
+                    # 估价坏了不是"等一等就好"的事，接着轮询只会刷屏。退出让人来修。
                     total.estimate_broken = True
                     self.log("估价不可用：退出 --loop（任务全部保持 queued）")
                     break
