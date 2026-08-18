@@ -165,19 +165,24 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
 
 提示词全在 `app/providers/prompts.py` 一个文件里，改完跑 `pytest tests/test_providers.py`
 验契约还在。**音标（ipa）是显式喂进 prompt 的**——谐音钩子必须依据读音而不是拼写，
-这条写死在模板里。`python -m app.annotate --dry-run` 会打印真实输入包，
-`provider.dump_prompt(batch)` 打印完整 system + user prompt。
+这条写死在模板里。`python -m app.annotate --dry-run` 会打印真实输入包**和真会发出去的
+请求体样例**（模型名 / `thinking` 开关 / `max_tokens`；messages 正文折成一行摘要，
+不含 key，也不发包），上线前拿它眼验一遍；`provider.dump_prompt(batch)` 打印完整
+system + user prompt。
 
 价目表写在各 provider 模块顶部的常量里（`app/providers/deepseek.py` 是
-`USD_PER_MTOK_*` 一组美元牌价 + 汇率常量 `USD_CNY`，换算出类上的
-`price_in_cny_per_mtok` / `price_out_cny_per_mtok`），**随时可能过期，自己核对官网后改**。
+`PRICE_*_CNY_PER_MTOK` 一组**官方人民币牌价 2026-08**，直接给到类上的
+`price_in_cny_per_mtok` / `price_out_cny_per_mtok`——**变价改这一处**），
+**随时可能过期，自己核对官网后改**。deepseek-v4-flash：峰时输入（cache-miss）
+¥3.0/百万 token、输出 ¥9.0/百万 token；错峰减半、缓存命中 ¥0.10 只作注释备查，
+**不参与估算**（保守原则）。峰时 = 北京时间 9:00–12:00 与 14:00–18:00。
 
 DeepSeek 默认模型是 **`deepseek-v4-flash`**（旧的 `deepseek-chat` / `deepseek-reasoner`
 已被官方宣布退役）。该系列**默认开 thinking 且 effort=high**，助记生成用不上，
 请求体里已显式写死 `"thinking": {"type": "disabled"}`，不然要重度多计费。
 换模型用 `--model`（只对真 provider 有意义，`fake` 忽略）。
 估价一律按**峰时 + cache-miss**（牌价最贵那档）算 —— 预算是硬顶，不许乐观估。
-按默认 `--batch-size 4` 算下来约 **¥0.004/词**，¥4 预算够跑 ~970 个词。
+按默认 `--batch-size 4` 算下来约 **¥0.0039/词**，¥4 预算够跑 ~1000 个词。
 
 ## prefetch：预热入队
 
