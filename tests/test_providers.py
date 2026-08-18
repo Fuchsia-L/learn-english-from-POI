@@ -32,6 +32,7 @@ from app.providers import (  # noqa: E402
 )
 from app.providers import _manual_validate  # noqa: E402
 from app.providers.base import approx_tokens, parse_json_array  # noqa: E402
+from app.providers.deepseek import DEFAULT_MODEL as DS_DEFAULT_MODEL  # noqa: E402
 from app.providers.fake import FakeInjectedFailure, FakeProvider  # noqa: E402
 from app.providers.prompts import build_user_prompt, debug_dump  # noqa: E402
 
@@ -442,6 +443,77 @@ def test_deepseek_payload_shape():
     assert payload["messages"][0]["role"] == "system"
     assert "items" in payload["messages"][1]["content"]
     assert p.headers()["authorization"] == "Bearer k"
+
+
+# --- 工单 8a：v4-flash 迁移 + 关 thinking + --model 覆盖（全程零网络） -------
+
+
+def test_deepseek_defaults_to_v4_flash():
+    """旧的 deepseek-chat / deepseek-reasoner 已退役，默认必须是 v4-flash。"""
+    assert DS_DEFAULT_MODEL == "deepseek-v4-flash"
+    p = get_provider("deepseek", api_key="k")
+    assert p.model == "deepseek-v4-flash"
+    assert p.payload(BATCH)["model"] == "deepseek-v4-flash"
+
+
+def test_deepseek_disables_thinking_explicitly():
+    """v4 系列默认 thinking 开着且 effort=high，不关会重度多计费（工单 8a）。"""
+    payload = get_provider("deepseek", api_key="k").payload(BATCH)
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+def test_deepseek_model_override_wins():
+    p = get_provider("deepseek", api_key="k", model="deepseek-v4")
+    assert p.model == "deepseek-v4"
+    assert p.payload(BATCH)["model"] == "deepseek-v4"
+    # 覆盖不许污染类属性：下一个默认实例还是 v4-flash
+    assert get_provider("deepseek", api_key="k").model == "deepseek-v4-flash"
+
+
+def test_deepseek_model_override_reaches_transport():
+    """model= 的透传终点是请求体本身（注入 transport 拦下来看，零真实网络）。"""
+    seen: list[dict] = []
+
+    def transport(payload: dict) -> dict:
+        seen.append(payload)
+        return _resp('[{"id":"101","context_gloss":"g","hooks":[]}]', "deepseek")
+
+    p = get_provider(
+        "deepseek", api_key="k", model="deepseek-v4-flash-2512", transport=transport
+    )
+    p.annotate([ITEM])
+    assert seen[0]["model"] == "deepseek-v4-flash-2512"
+    assert seen[0]["thinking"] == {"type": "disabled"}
+
+
+def test_deepseek_price_table_is_peak_cache_miss():
+    """估价口径：峰时 + cache-miss（牌价最贵那档）——预算是硬顶，不许乐观估。"""
+    import app.providers.deepseek as DS
+
+    assert DS.USD_PER_MTOK_IN_MISS_PEAK == 0.44
+    assert DS.USD_PER_MTOK_IN_MISS_OFF == 0.22
+    assert DS.USD_PER_MTOK_IN_HIT_PEAK == 0.014
+    assert DS.USD_PER_MTOK_IN_HIT_OFF == 0.007
+    assert DS.USD_PER_MTOK_OUT_PEAK == 1.32
+    assert DS.USD_PER_MTOK_OUT_OFF == 0.66
+    p = get_provider("deepseek")
+    # 类上的人民币价 = 峰时美元价 × 可配置汇率常量
+    assert p.price_in_cny_per_mtok == pytest.approx(
+        DS.USD_PER_MTOK_IN_MISS_PEAK * DS.USD_CNY
+    )
+    assert p.price_out_cny_per_mtok == pytest.approx(
+        DS.USD_PER_MTOK_OUT_PEAK * DS.USD_CNY
+    )
+    # 谷时/命中缓存都比估价便宜：估价确实是上界
+    assert DS.USD_PER_MTOK_IN_MISS_OFF < DS.USD_PER_MTOK_IN_MISS_PEAK
+    assert DS.USD_PER_MTOK_OUT_OFF < DS.USD_PER_MTOK_OUT_PEAK
+
+
+def test_deepseek_estimate_is_sane_per_word():
+    """一批 4 词（默认 batch）每词约 ¥0.004；离线可算，不发请求。"""
+    batch = [{**ITEM, "id": str(i)} for i in range(4)]
+    per_word = get_provider("deepseek").estimate_cost(batch) / 4
+    assert 0.002 < per_word < 0.008
 
 
 def _resp(text: str, name: str) -> dict:
