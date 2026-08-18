@@ -724,6 +724,31 @@ def build_provider(name: str, model: str | None = None) -> Provider:
         return get_provider(name)
 
 
+def payload_sample(provider: Provider, packs: Sequence[dict], batch_size: int) -> dict | None:
+    """provider **真会发出去**的请求体，离线组装：不发包、不读 key、不含鉴权头。
+
+    上线前用它眼验两件最花钱的事：模型名对不对（--model 有没有真的透传到请求体）、
+    thinking 有没有关（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
+    想看正文用 provider.dump_prompt(batch)。provider 没有 payload()（比如 fake）
+    就返回 None，调用方跳过这行。
+    """
+    fn = getattr(provider, "payload", None)
+    if not callable(fn) or not packs:
+        return None
+    try:
+        body = fn([dict(p) for p in packs[: max(1, batch_size)]])
+    except Exception:  # 组装失败不许拖垮 dry-run
+        return None
+    if not isinstance(body, dict):
+        return None
+    out = dict(body)
+    msgs = out.get("messages")
+    if isinstance(msgs, list):
+        chars = sum(len(str(m.get("content", ""))) for m in msgs if isinstance(m, dict))
+        out["messages"] = f"<{len(msgs)} 条 / 共 {chars} 字符，正文见 dump_prompt()>"
+    return out
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m app.annotate",
@@ -788,6 +813,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             for pack in info["packs"][:10]:
                 print("  " + json.dumps(pack, ensure_ascii=False))
+            sample = payload_sample(provider, info["packs"], args.batch_size)
+            if sample is not None:
+                print("  请求体样例(不发送): " + json.dumps(sample, ensure_ascii=False))
             return EXIT_ESTIMATE_BROKEN if info.get("estimate_error") else 0
 
         worker.reset_stale_running()
