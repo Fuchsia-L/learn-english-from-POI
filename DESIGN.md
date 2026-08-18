@@ -24,8 +24,11 @@ FastAPI + SQLite + 单文件前端播放器（vanilla JS）。本地起服务，
 
 ```
 app/
-├── db.py          # SQLite schema + 连接（表结构见 §2）
+├── consts.py      # 跨模块共享常量（默认路径、任务优先级）——谁都能 import
+├── db.py          # SQLite schema + 连接登记簿（表结构见 §2）
+├── ecdict.py      # ECDICT 查询 + Lexeme 回填口径（server / annotate 共用，不依赖 web）
 ├── ingest.py      # srt → Content/Segment/token/lemma 入库
+├── review.py      # M1 复习规则（滚动窗口 + 会/不会 + 毕业；纯 SQLite，见 §7）
 ├── server.py      # FastAPI：API + Range 媒体接口 + 静态托管 player
 ├── annotate.py    # 异步助记 worker（AnnotationJob 队列驱动，provider 可插拔）
 ├── providers/     # anthropic.py（现在）/ deepseek.py（预留，钩子生成的目标提供方）
@@ -35,7 +38,8 @@ data/               # 不入库；由脚本在本地构建
 └── cet46.txt      # 预热词表
 scripts/
 ├── extract_hardsub.py   # ✅ 已完成；待升级：同时输出词级包围盒（见 §4）
-└── build_ecdict.py      # 下载/转换 ECDICT → data/ecdict.db
+├── build_ecdict.py      # 下载/转换 ECDICT → data/ecdict.db
+└── build_cet46.py       # 下载/合并 CET4+CET6 大纲词表 → data/cet46.txt
 ```
 
 ## 2. 数据表（v0.2：语义拆分，一表一职）
@@ -143,5 +147,13 @@ id = AnnotationJob.id，批量对位的唯一依据）：
 - lemma 库：默认 simplemma（纯 Python 零模型）；验收不达标升级 spaCy。
 - Wiktionary 词源解析（事实区的前置条件），远期。
 - 复习调度：M1 先"最近几天滚动 + 会/不会"，FSRS 以后再说。
+  **后端已落地**（工单 9，UI 仍冻结）：规则在 `app/review.py` 的常量里——
+  进队 = 未毕业 且 今天(UTC)没复习过 且（`added_at` 在最近 `REVIEW_WINDOW_DAYS=7`
+  天内 或 历史上答过 dont）；排序 = 从未复习最优先，其次上次复习最早；
+  毕业 = 末尾连续 `GRADUATE_STREAK=2` 次 know 且**最后一次复习**距首次收藏
+  ≥ `GRADUATE_MIN_AGE_DAYS=3` 天。端点：`GET /review/next?limit=`、
+  `POST /review/answer {vocab_entry_id, result}`（同日同答案幂等）、`GET /review/stats`。
 - DeepSeek provider 正式接入（含费用核算脚本）。
-- 重构债：ECDICT 查询/回填口径（EcdictStore 等）现居 app/server.py，annotate worker 反向依赖 web 层——待抽到 app/ecdict.py（工单5 偏离点 #5）。
+- ~~重构债：ECDICT 查询/回填口径（EcdictStore 等）现居 app/server.py，annotate worker
+  反向依赖 web 层~~ —— 工单 9 已还：抽到 `app/ecdict.py`（连接登记簿下沉到 `app/db.py`，
+  共享常量进 `app/consts.py`），`import app.annotate` 不再拖进 fastapi 链条（有测试守着）。
