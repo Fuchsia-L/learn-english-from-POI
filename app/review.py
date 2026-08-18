@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Sequence
 
+from app.db import ENCOUNTER_SELECT, encounter_view
+
 # --- 规则常量（DESIGN §7：M1 先滚动 + 会/不会，FSRS 以后再说） --------------
 
 REVIEW_WINDOW_DAYS = 7  # 「最近几天滚动」的 N：added_at 在这个窗口内就进队
@@ -242,30 +244,32 @@ def due_states(
 def _latest_encounters(
     conn: sqlite3.Connection, entry_ids: Sequence[int]
 ) -> dict[int, dict[str, Any]]:
-    """每个 entry 最近一条 encounter（按 Encounter.id 最大者）。"""
+    """每个 entry 最近一条 encounter（按 Encounter.id 最大者）。
+
+    来源可以是字幕段，也可以是网页划词（工单 11）——两种来源统一由
+    `app.db.encounter_view` 铺平成同一套键名，本模块不关心它从哪来。
+    """
     if not entry_ids:
         return {}
     marks = ",".join("?" * len(entry_ids))
     rows = conn.execute(
-        "SELECT E.id, E.vocab_entry_id, E.surface, E.added_at, E.segment_id,"
-        "       S.text_en, S.t_start, S.content_id, C.title, C.season_ep "
-        "FROM Encounter E "
-        "LEFT JOIN Segment S ON S.id = E.segment_id "
-        "LEFT JOIN Content C ON C.id = S.content_id "
-        f"WHERE E.vocab_entry_id IN ({marks}) ORDER BY E.id",
+        ENCOUNTER_SELECT + f"WHERE E.vocab_entry_id IN ({marks}) ORDER BY E.id",
         list(entry_ids),
     ).fetchall()
     out: dict[int, dict[str, Any]] = {}
     for r in rows:  # 升序遍历，后写的覆盖前面的 → 留下 id 最大那条
+        view = encounter_view(r)
         out[int(r["vocab_entry_id"])] = {
-            "encounter_id": r["id"],
-            "surface": r["surface"],
-            "segment_id": r["segment_id"],
-            "sentence": r["text_en"],
-            "t_start": r["t_start"],
-            "content_id": r["content_id"],
-            "title": r["title"],
-            "season_ep": r["season_ep"],
+            "encounter_id": view["id"],
+            "surface": view["surface"],
+            "source_kind": view["source_kind"],
+            "segment_id": view["segment_id"],
+            "sentence": view["sentence"],
+            "t_start": view["t_start"],
+            "content_id": view["content_id"],
+            "title": view["title"],
+            "season_ep": view["season_ep"],
+            "url": view["url"],
         }
     return out
 
