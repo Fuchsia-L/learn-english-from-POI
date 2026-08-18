@@ -6,19 +6,36 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 PathLike = Union[str, Path]
+
+# Encounter 的列定义单独拎出来：建库（SCHEMA）与老库迁移（_migrate_encounter）
+# 必须逐字用同一份 DDL，否则新库老库长得不一样，是最难查的那种 bug。
+ENCOUNTER_BODY = """(
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    vocab_entry_id  INTEGER NOT NULL REFERENCES VocabEntry(id) ON DELETE CASCADE,
+    segment_id      INTEGER REFERENCES Segment(id) ON DELETE CASCADE,
+    surface         TEXT NOT NULL,
+    added_at        TEXT NOT NULL,
+    source_kind     TEXT NOT NULL DEFAULT 'segment'
+                    CHECK (source_kind IN ('segment', 'web')),
+    context_json    TEXT
+)"""
+
+SOURCE_SEGMENT = "segment"
+SOURCE_WEB = "web"
 
 # --- DESIGN §2 的 9 张表 -------------------------------------------------
 # M0 只用到 Content/Segment/Lexeme/WordForm/VocabEntry/Encounter/AnnotationJob，
 # Mnemonic（M1）与 Review（M1）先建好，避免后续迁移。
-SCHEMA = """
+SCHEMA = f"""
 -- 1. 一集（或一个片段）的媒体 + 字幕来源
 CREATE TABLE IF NOT EXISTS Content (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,14 +87,11 @@ CREATE TABLE IF NOT EXISTS VocabEntry (
     note        TEXT
 );
 
--- 6. 每次真实语境下的相遇
-CREATE TABLE IF NOT EXISTS Encounter (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    vocab_entry_id  INTEGER NOT NULL REFERENCES VocabEntry(id) ON DELETE CASCADE,
-    segment_id      INTEGER NOT NULL REFERENCES Segment(id) ON DELETE CASCADE,
-    surface         TEXT NOT NULL,
-    added_at        TEXT NOT NULL
-);
+-- 6. 每次真实语境下的相遇（v2 泛化：不只来自字幕段）
+--    source_kind='segment' → segment_id 指字幕段，语境从 Segment/Content 取；
+--    source_kind='web'     → segment_id 为 NULL，语境存 context_json
+--                            {{url, title, sentence}}（浏览器划词插件，工单 11）。
+CREATE TABLE IF NOT EXISTS Encounter {ENCOUNTER_BODY};
 CREATE INDEX IF NOT EXISTS idx_encounter_vocab ON Encounter (vocab_entry_id);
 
 -- 7. 异步助记任务队列（与收藏解耦）
@@ -153,7 +167,7 @@ class ConnRegistry:
     """可枚举的连接登记簿：每线程一条连接 → 登记 → 统一关闭。线程安全。
 
     （工单 9：原居 app/server.py 的 `_ConnRegistry`，因 EcdictStore 抽到
-    app/ecdict.py 而下沉到这里——连接管理本来就是 db 层的事。）
+    app/ecdict.py 而下沉到这里——连接管理本来就是 db 层的事。
 
     每线程一条的代价：threading.local 只够本线程自己关，进程要退出时够不着别的
     线程那些连接 —— Windows 上就表现为 .db 文件被锁住、删不掉也重建不了（工单 6-4）。
@@ -225,9 +239,112 @@ class Database(ConnRegistry):
         return c
 
 
+# --- 语境读取口径（/vocab 与 /review/next 共用，见工单 11） -----------------
+
+# Encounter 一行的完整语境：字幕来源要 JOIN 出剧集信息，web 来源全在 context_json 里。
+# LEFT JOIN 是关键：web 行的 segment_id 是 NULL，INNER JOIN 会把它整行吃掉。
+ENCOUNTER_SELECT = (
+    "SELECT E.id, E.vocab_entry_id, E.surface, E.added_at, E.segment_id,"
+    "       E.source_kind, E.context_json,"
+    "       S.text_en, S.t_start, S.content_id, C.title, C.season_ep "
+    "FROM Encounter E "
+    "LEFT JOIN Segment S ON S.id = E.segment_id "
+    "LEFT JOIN Content C ON C.id = S.content_id "
+)
+
+
+def encounter_view(row: sqlite3.Row) -> dict[str, Any]:
+    """Encounter 行（按 ENCOUNTER_SELECT 取）→ 前端字段。两种来源同一套键名。
+
+    - segment 来源：sentence/t_start/content_id/title/season_ep 来自 Segment/Content，
+      url 为 None（前端据此给「去这句」按钮）。
+    - web 来源：sentence/url/title 来自 context_json，时间轴相关字段全 None。
+    """
+    kind = row["source_kind"] if "source_kind" in row.keys() else SOURCE_SEGMENT
+    kind = kind or SOURCE_SEGMENT
+    ctx: dict[str, Any] = {}
+    if kind == SOURCE_WEB:
+        raw = row["context_json"]
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    ctx = loaded
+            except (ValueError, TypeError):
+                ctx = {}
+    return {
+        "id": row["id"],
+        "surface": row["surface"],
+        "added_at": row["added_at"],
+        "source_kind": kind,
+        "segment_id": row["segment_id"],
+        "sentence": ctx.get("sentence") if kind == SOURCE_WEB else row["text_en"],
+        "t_start": None if kind == SOURCE_WEB else row["t_start"],
+        "content_id": None if kind == SOURCE_WEB else row["content_id"],
+        "title": ctx.get("title") if kind == SOURCE_WEB else row["title"],
+        "season_ep": None if kind == SOURCE_WEB else row["season_ep"],
+        "url": ctx.get("url") if kind == SOURCE_WEB else None,
+    }
+
+
+# --- 迁移 ------------------------------------------------------------------
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _migrate_encounter(conn: sqlite3.Connection) -> bool:
+    """v1 → v2：Encounter 泛化（segment_id 可空 + source_kind + context_json）。
+
+    SQLite 改不了列的 NOT NULL 约束，只能整表重建（官方 12 步法的精简版）：
+    建新表 → 搬数据 → 删旧表 → 改名。新表 DDL 与建库共用 ENCOUNTER_BODY，
+    保证"老库迁上来"和"新库直接建"长得一模一样。
+
+    幂等：已经有 source_kind 列（或压根没有 Encounter 表）就直接返回 False。
+    老数据全部按 source_kind='segment' 落位——历史 encounter 本来就来自字幕段。
+    """
+    if not _table_exists(conn, "Encounter"):
+        return False
+    if "source_kind" in _columns(conn, "Encounter"):
+        return False
+
+    # 重建期间必须关外键：DROP TABLE 会先让子表引用悬空。
+    # PRAGMA foreign_keys 在事务里改无效，所以先提交干净再动。
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:
+            conn.execute(f"CREATE TABLE Encounter_migrating {ENCOUNTER_BODY}")
+            conn.execute(
+                "INSERT INTO Encounter_migrating "
+                "(id, vocab_entry_id, segment_id, surface, added_at, source_kind) "
+                f"SELECT id, vocab_entry_id, segment_id, surface, added_at, '{SOURCE_SEGMENT}' "
+                "FROM Encounter"
+            )
+            conn.execute("DROP TABLE Encounter")
+            conn.execute("ALTER TABLE Encounter_migrating RENAME TO Encounter")
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:  # 老库本来就有孤儿行才可能触发；宁可炸也不静默留脏数据
+            raise sqlite3.IntegrityError(f"Encounter 迁移后外键不自洽: {bad[:3]}")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+    return True
+
+
 def init_db(path: PathLike) -> sqlite3.Connection:
-    """建库建表（幂等），返回已连接的 conn。"""
+    """建库建表（幂等），返回已连接的 conn。老库自动迁移到当前 SCHEMA_VERSION。"""
     conn = get_conn(path)
+    _migrate_encounter(conn)
     with conn:
         conn.executescript(SCHEMA)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
