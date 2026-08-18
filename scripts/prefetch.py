@@ -24,14 +24,17 @@ from typing import Iterable, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.consts import DEFAULT_DB, DEFAULT_WORDLIST, PREFETCH_PRIORITY  # noqa: E402
 from app.db import init_db  # noqa: E402
 from app.ingest import normalize_surface  # noqa: E402
 
-PREFETCH_PRIORITY = 0  # 低优先级（DESIGN §5）
-
 WORDLIST_HINT = """\
 [hint] 词表 {path} 不存在。它是一行一个单词的纯文本（小写即可，# 开头为注释）。
-       手上已有 data/ecdict.db 的话，一条命令就能生成 CET4/6 词表：
+       建 CET4+CET6 词表就一条命令（联网克隆公开词表仓库，用完自删）：
+
+         python scripts/build_cet46.py -o {path}
+
+       网络不通、手上已有 data/ecdict.db 的话，也可以从考试标签里导：
 
          python - <<'EOF'
          import sqlite3, pathlib
@@ -167,9 +170,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python scripts/prefetch.py",
         description="当集 lemma ∩ 词表 → 低优先级入队（DESIGN §5 预热）",
     )
-    ap.add_argument("--db", default="data/poi.db")
+    ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--content-id", type=int, required=True)
-    ap.add_argument("--wordlist", default="data/cet46.txt")
+    ap.add_argument("--wordlist", default=DEFAULT_WORDLIST)
     ap.add_argument("--limit", type=int, default=None, help="最多入队多少词")
     ap.add_argument("--priority", type=int, default=PREFETCH_PRIORITY)
     ap.add_argument("--dry-run", action="store_true", help="只算不写")

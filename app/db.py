@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Union
 
@@ -146,6 +147,82 @@ def get_conn(path: PathLike, check_same_thread: bool = True) -> sqlite3.Connecti
         conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+class ConnRegistry:
+    """可枚举的连接登记簿：每线程一条连接 → 登记 → 统一关闭。线程安全。
+
+    （工单 9：原居 app/server.py 的 `_ConnRegistry`，因 EcdictStore 抽到
+    app/ecdict.py 而下沉到这里——连接管理本来就是 db 层的事。）
+
+    每线程一条的代价：threading.local 只够本线程自己关，进程要退出时够不着别的
+    线程那些连接 —— Windows 上就表现为 .db 文件被锁住、删不掉也重建不了（工单 6-4）。
+    所以每开一条连接都往**显式注册表**里登记（sqlite3.Connection 不支持弱引用，
+    只能用强引用列表；连接数上限 = 线程池大小，不会涨飞）。close_all() 时统一关掉：
+    sqlite3 允许跨线程 close，前提是连接开的时候带 check_same_thread=False。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._local = threading.local()
+        self._conns: list[sqlite3.Connection] = []
+
+    def _register(self, conn: sqlite3.Connection) -> sqlite3.Connection:
+        with self._lock:
+            self._conns.append(conn)
+        return conn
+
+    def close_all(self) -> int:
+        """关掉本对象开过的所有连接（含别的线程开的），返回关掉几条。
+
+        换掉 threading.local 实例本身，等于一次性丢掉**所有**线程缓存的引用；
+        之后哪个线程再来取连接都会重开一条，对象因此可以继续用。
+        """
+        with self._lock:
+            conns, self._conns = self._conns, []
+            self._local = threading.local()
+        n = 0
+        for c in conns:
+            try:
+                c.close()
+                n += 1
+            except sqlite3.Error:
+                pass
+        return n
+
+    def _cached(self) -> sqlite3.Connection | None:
+        return getattr(self._local, "conn", None)
+
+    def _cache(self, conn: sqlite3.Connection | None) -> None:
+        self._local.conn = conn
+
+
+class Database(ConnRegistry):
+    """poi.db 的每线程连接池。首次取连接时建表（幂等），import 阶段不碰磁盘。"""
+
+    def __init__(self, path: PathLike) -> None:
+        super().__init__()
+        self.path = Path(path)
+        self._schema_lock = threading.Lock()
+        self._ready = False
+
+    def _ensure_schema(self) -> None:
+        if self._ready:
+            return
+        with self._schema_lock:
+            if not self._ready:
+                init_db(self.path).close()
+                self._ready = True
+
+    def conn(self) -> sqlite3.Connection:
+        c = self._cached()
+        if c is None:
+            self._ensure_schema()
+            # check_same_thread=False：连接仍然只给开它的那个线程用，
+            # 放开只是为了 close_all() 能在退出时跨线程关掉它（工单 6-4）
+            c = self._register(get_conn(self.path, check_same_thread=False))
+            self._cache(c)
+        return c
 
 
 def init_db(path: PathLike) -> sqlite3.Connection:
