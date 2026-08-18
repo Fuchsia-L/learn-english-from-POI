@@ -19,7 +19,7 @@
    schema；缺 id / id 不在本批 / 重复 id / 不合 schema 的元素丢弃，对应任务下一轮
    只重试没对上的那些；
 4. 写 Mnemonic：context_gloss 单独一行 kind="gloss"，每个 hook 按 type 拆行存；
-   version 递增；**edited_by_user=1 的那个 kind 永不覆盖**；
+   version 递增；**edited_by_user=1 的那个 kind 永不被覆盖**；
 5. job 置 done / failed（重试 --retries 次后仍失败才置 failed）。
 
 预算制（工单 6-1 修）：estimate_cost 的累计与 --budget 检查发生在**每一次真实
@@ -32,6 +32,11 @@ inf / 负数时，**本轮立即停手**——任务保持（或放回）queued�
 都不发，日志写明原因，进程退出码 3。不许再像以前那样"估价失败按 ¥0 处理"然后
 照跑不误。高优先级（点击收藏）同样停：估价系统坏了就是坏了，不确定成本时
 一分钱都不许花。
+
+牌价（工单 16）：各 provider 的价目是一个带 currency/来源/as_of 的结构，估价结果
+与 --dry-run 打印都会带上 as_of（"这是某天抄的牌价"要肉眼可见）。不改代码也能覆盖：
+POI_DEEPSEEK_PRICE_IN/OUT、POI_ANTHROPIC_PRICE_IN/OUT（元 / 百万 token）。覆盖值
+非法（负数 / NaN / 非数 / 空串）不会被忽略，而是走上面那条 fail closed 停手路径。
 
 健壮性：单个任务/单个批次炸掉只影响它自己，worker 不崩；provider 抛什么异常都接。
 本模块除 provider 外不发任何网络请求（provider=fake 时全程零网络）。
@@ -89,6 +94,23 @@ class EstimateUnavailable(RuntimeError):
     **绝不按 ¥0 处理**。不知道要花多少钱的时候一分钱都不许花——不管是预热的
     低优先级任务还是用户点击收藏的高优先级任务，一律停手、任务留在 queued。
     """
+
+
+def price_info(provider: Any) -> tuple[str, str]:
+    """(一行牌价说明, 短标注)。牌价是**某一天抄的一个数**，得让它露脸（工单 16-2）。
+
+    provider 没有牌价概念（比如 fake）就返回两个空串，调用方跳过不打印；
+    牌价配置坏了（比如 POI_DEEPSEEK_PRICE_IN=-1）也不在这儿抛——如实报"不可用"，
+    真正的停手由 estimate_cost 走 fail closed 路径完成（工单 8b）。
+    """
+    fn = getattr(provider, "resolved_price", None)
+    if not callable(fn):
+        return "", ""
+    try:
+        price = fn()
+        return str(price.label()), str(price.stamp())
+    except Exception as exc:
+        return f"牌价不可用：{type(exc).__name__}: {exc}", "牌价不可用"
 
 
 def _now() -> str:
@@ -693,6 +715,8 @@ class AnnotateWorker:
         """只组包 + 估价，不调 provider、不写库、不改任务状态。"""
         jobs = self._prepare_dry(self.queued_jobs(self.limit))
         error = ""
+        # 牌价说明（含 as_of）跟着估价一起报——光看一个 ¥ 数字不知道它按哪天的价算的
+        price, price_stamp = price_info(self.provider)
         try:
             est = self._estimate(jobs) if jobs else 0.0
         except EstimateUnavailable as exc:  # 估价坏了就如实说，别报一个假的 0
@@ -704,6 +728,8 @@ class AnnotateWorker:
                 "estimate_error": error,
                 "budget": self.budget,
                 "over_budget": True,  # 不知道多贵 = 当作贵到超预算
+                "price": price,
+                "price_as_of": price_stamp,
                 "packs": [j.pack for j in jobs],
             }
         return {
@@ -712,6 +738,8 @@ class AnnotateWorker:
             "estimate_error": "",
             "budget": self.budget,
             "over_budget": est > self.budget,
+            "price": price,
+            "price_as_of": price_stamp,
             "packs": [j.pack for j in jobs],
         }
 
@@ -748,7 +776,7 @@ def payload_sample(provider: Provider, packs: Sequence[dict], batch_size: int) -
     """provider **真会发出去**的请求体，离线组装：不发包、不读 key、不含鉴权头。
 
     上线前用它眼验两件最花钱的事：模型名对不对（--model 有没有真的透传到请求体）、
-    thinking 有没有关（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
+    thinking 有没有开（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
     想看正文用 provider.dump_prompt(batch)。provider 没有 payload()（比如 fake）
     就返回 None，调用方跳过这行。
     """
@@ -813,11 +841,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         content_id=args.content_id,
         log=log,
     )
+    _, price_stamp = price_info(provider)
     with worker:
         if not args.quiet:
             print(
                 f"[annotate] db={args.db} provider={worker.provider_name} "
                 f"budget=¥{args.budget:.2f} batch={args.batch_size}"
+                + (f" {price_stamp}" if price_stamp else "")
             )
         if args.dry_run:
             info = worker.dry_run()
@@ -831,6 +861,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"[annotate] dry-run: {info['jobs']} 个任务，"
                     f"预估 ¥{info['estimate_cny']}（预算 ¥{info['budget']:.2f}）"
                 )
+            if info.get("price"):
+                print(f"  牌价(估算依据): {info['price']}")
             for pack in info["packs"][:10]:
                 print("  " + json.dumps(pack, ensure_ascii=False))
             sample = payload_sample(provider, info["packs"], args.batch_size)
@@ -847,7 +879,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"skipped_budget={d['skipped_budget']} "
         f"skipped_estimate={d['skipped_estimate']} rows={d['rows']} "
         f"calls={d['calls']} est_cost=¥{d['est_cost']}（预算 ¥{args.budget:.2f}，"
-        f"含重试的每次调用都计费）"
+        f"含重试的每次调用都计费"
+        + (f"，{price_stamp}" if price_stamp else "")
+        + "）"
     )
     if d["estimate_broken"]:
         print(
