@@ -11,6 +11,7 @@
 - [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
 - [x] 预热词表 (`scripts/build_cet46.py`) — CET4+CET6 大纲词表 → `data/cet46.txt`（lemma 归一、去重）
 - [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 最近 7 天滚动 + 会/不会 + 毕业规则，纯 SQLite、不碰 LLM
+- [x] 浏览器划词插件 (`extension/`) — 任意网页选中英文词 → ⌖ 浮标 → 终端风查询卡 → 收进同一个生词本（`POST /collect/web`，encounter 记 URL + 整句）
 - [ ] 复习界面（播放器的第三个 tab；后端接口已就绪，UI 还没接）
 
 核心原则:LLM 只产语义,代码管装配和钱;词元(lexeme)为主键,encounter 记录每次真实语境;按需生产,看到哪集造到哪集。
@@ -46,9 +47,14 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 ```
 
 端点见 DESIGN §3：`/episodes`、`/media/{content_id}`（HTTP Range，拖进度条用）、
-`/segments?content_id=`、`/lookup?surface=&segment_id=`、`POST /collect`、`/vocab`、
+`/segments?content_id=`、`/lookup?surface=&segment_id=`（`segment_id` 可省，裸查词）、
+`POST /collect`、`POST /collect/web`（浏览器划词插件，见下）、`/vocab`、
 `/mnemonic?lexeme_id=`；`/` 重定向到 `/static/player.html`。全程本地 SQLite，无网络调用；
 `data/ecdict.db` 缺失时 `/lookup` 降级为 `in_dict=false` 而不报错。
+
+服务只监听 `127.0.0.1`，并且**只**给 `/lookup` 与 `/collect/web` 两个端点发 CORS 放行头，
+且只认 `chrome-extension://` / `moz-extension://` 这类扩展 origin —— 别的网页的 JS
+读不走生词本，别的端点（`/vocab`、`/segments`、`/review/*`…）一律没有跨域许可。
 
 ECDICT 的查询/回填口径住在 `app/ecdict.py`，`app/server.py` 和 `app/annotate.py` 共用
 同一份实现——worker 不 import web 层（`import app.annotate` 不会拖进 fastapi），
@@ -94,7 +100,8 @@ curl http://127.0.0.1:8000/review/stats
 - **播放界面**：视频 + 自绘控制条 + 当前段文本 + 字幕三档 + 词框热区 + 查询卡。
 - **生词本界面**：卡片栅格（`auto-fill minmax(330px,1fr)`），每张卡展开
   词元/音标/词性/词典释义 + **AI 助记** + 全部 encounter（集数、时间、原形、原句），
-  每条 encounter 有「去这句」按钮直接跳回播放界面定位到那一秒。
+  每条 encounter 有「去这句」按钮直接跳回播放界面定位到那一秒；
+  来自浏览器划词插件的 encounter 显示 `🌐 页面标题`（网页没有时间轴，不给「去这句」）。
   数据只在**打开这个界面时拉一次**（`/vocab` 一次 + 每张卡的 `/mnemonic` 各一次），
   **不轮询**；worker 后来生成的助记要点右上角的「刷新」才会出现。
 
@@ -173,8 +180,9 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
 
 - **取任务口径**：`status='queued'`，`priority DESC, id ASC`。点击收藏 = priority 10
   插队，预热 = priority 0。
-- **输入包**（一词一包，DESIGN §5）：lemma + ECDICT 音标/词性/释义 + 最近一条
-  Encounter 的原句/时间戳/集数；预热词没有 encounter 就退回"当集任一含该词的字幕原句"。
+- **输入包**（一词一包，DESIGN §5）：lemma + ECDICT 音标/词性/释义 + 最近一条**带原句的**
+  Encounter 的原句/时间戳/集数（网页来源的 `episode` 写 `"web"`、没有时间戳）；
+  预热词没有 encounter 就退回"当集任一含该词的字幕原句"。
 - **输出**强制过 JSON schema（`app/providers/__init__.py` 的 `ANNOTATION_SCHEMA`），
   不合规就重试，`--retries`（默认 2）次后该任务置 `failed`，不影响同批其他词。
 - **落库**：`context_gloss` 单独一行 `kind="gloss"`，每条 hook 按 `type` 拆行
@@ -245,6 +253,41 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --once --budget 
 （`scripts/build_cet46.py`，或从 `data/ecdict.db` 的 `tag` 字段导）并以非零码退出。
 `--dry-run` 只算不写。2 分钟真实片段实测：当集 144 个 lemma、命中词表 124 个、
 入队 123 个（1 个已有任务跳过）。
+
+## extension：浏览器划词插件（M3-lite）
+
+`extension/` 是一个零依赖、零构建的 MV3 扩展（Chromium 与 Firefox 共用一份 manifest）：
+任意网页选中英文词 → 选区旁浮出 ⌖ → 点开终端风查询卡（当前形式/词元/音标/释义/
+自动截取的整句/已收状态）→ `[收入生词本]` → 落进同一个 `data/poi.db`。
+
+```
+extension/
+├── manifest.json   # MV3；background 两个键都写（Chrome 用 service_worker，Firefox 用 scripts）
+├── content.js      # UI + 句子扩取（不发网络请求）
+├── bg.js           # 唯一发请求的地方；**服务地址常量在第一行**
+└── styles.css      # 与 player.html 同族的终端风（挂在 Shadow DOM 里，不污染页面）
+```
+
+加载方法（Chrome/Edge/Firefox 逐步骤）见 QUICKSTART §7。
+
+设计要点：
+
+- **网络请求只在 bg.js**：Chrome 85 起内容脚本的 fetch 走页面 origin，会被同源策略挡死
+  （实测 `Failed to fetch`）；后台脚本用扩展身份 + `host_permissions` 才连得上 127.0.0.1。
+- **权限最小**：`permissions` 一个都不要（不用 storage/tabs/scripting），
+  `host_permissions` 只有 `http://127.0.0.1/*` 与 `http://localhost/*`；
+  内容脚本 `matches` 限于 `http(s)`。没用 `activeTab` 是因为它要求用户先点扩展图标才授权，
+  而"选中就浮标"必须在用户动作之前就在页面里待命 —— 代价是常驻注入，
+  所以内容脚本本身不联网、不写存储、不改页面 DOM（UI 全在自己的 Shadow DOM 里，选中才创建）。
+- **状态零持久化**：不碰任何浏览器存储 API，状态只活在页面内存里。
+- **句子扩取两层**：DOM 层把选区所在块级容器拍平（行内标签拼起来、块级标签之间插 `\n`），
+  纯函数层 `sliceSentence` 往两侧扩到句边界（缩写 `Mr.`/小数 `3.5`/域名 `a.com`/
+  首字母 `J. K.` 都不当句号；两侧各最多 400 字符，扩不到边界就在词缝处截断）。
+  纯函数层被 `tests/test_extension_sentence.py` 用 node 直接单测。
+
+服务端配套：`POST /collect/web {surface, sentence, url, title}`（与 `/collect` 同一条链路、
+同一套幂等口径），`Encounter` 泛化为 `segment_id` 可空 + `source_kind`（`segment|web`）+
+`context_json`；CORS 只对 `/lookup` 与 `/collect/web`、且只对扩展 origin 放行。
 
 ## extract_hardsub.py
 
