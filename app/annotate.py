@@ -50,7 +50,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from app.consts import COLLECT_JOB_PRIORITY, DEFAULT_DB, DEFAULT_ECDICT
 from app.db import get_conn, init_db
+
+# ECDICT 查询口径（word_lower + 优先本身小写那条）与 pos/释义取法只有一份实现，
+# 住在 app/ecdict.py（工单 9 抽层）：worker 与 server 共用，且 worker **不再
+# import web 层** —— 后台任务不该把 fastapi/starlette 整条链拖进来。
+from app.ecdict import EcdictStore, fill_from_ecdict
 from app.providers import (
     Provider,
     ProviderNotConfigured,
@@ -58,12 +64,6 @@ from app.providers import (
     match_annotations,
 )
 
-# ECDICT 查询口径（word_lower + 优先本身小写那条）与 pos/释义取法只有一份实现，
-# 放在 server 里；worker 直接复用，免得两处口径漂移。
-from app.server import COLLECT_JOB_PRIORITY, EcdictStore, _fill_from_ecdict
-
-DEFAULT_DB = "data/poi.db"
-DEFAULT_ECDICT = "data/ecdict.db"
 DEFAULT_BUDGET = 4.0  # 元 / 每次 worker 运行（DESIGN §5：每集默认上限 ¥4）
 DEFAULT_BATCH = 4
 DEFAULT_RETRIES = 2  # 失败重试 2 次后置 failed
@@ -291,7 +291,7 @@ class AnnotateWorker:
             raise LookupError(f"lexeme {job.lexeme_id} 不存在")
         lemma = lex["lemma"]
         # ECDICT 回填（顺手把 Lexeme 缓存补齐，生词本立刻能显示释义）
-        fields, _in_dict = _fill_from_ecdict(self.conn, self.ecdict, lex, lemma, lemma)
+        fields, _in_dict = fill_from_ecdict(self.conn, self.ecdict, lex, lemma, lemma)
 
         enc = self._latest_encounter(job.lexeme_id)
         if enc is not None:
