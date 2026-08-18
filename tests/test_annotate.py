@@ -883,3 +883,41 @@ def test_cli_model_flag_reaches_build_provider(env: dict, monkeypatch, capsys):
     ])
     assert rc == 0
     assert seen == {"name": "deepseek", "model": "deepseek-v4-flash-2512"}
+
+
+# --- 分层（工单 9：worker 不许反向依赖 web 层） -----------------------------
+
+
+def test_worker_does_not_import_web_layer():
+    """`import app.annotate` 不许把 fastapi/starlette/pydantic/uvicorn 拖进来。
+
+    ECDICT 口径抽到 app/ecdict.py 之前，worker `from app.server import ...`，
+    一个后台任务要靠整条 web 栈才能起来（DESIGN §7 重构债）。这里在**干净的
+    子进程**里断言 sys.modules，本进程早就 import 过 fastapi，断言不了。
+    """
+    import subprocess
+
+    code = (
+        "import sys; import app.annotate;"
+        "web = sorted(m for m in sys.modules"
+        " if m.split('.')[0] in ('fastapi','starlette','uvicorn','pydantic'));"
+        "print(web)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "[]", f"worker 又把 web 层拖进来了：{proc.stdout}"
+
+
+def test_worker_and_server_share_one_ecdict_implementation():
+    """口径只有一份：两边用的必须是 app.ecdict 里的同一个对象。"""
+    from app import ecdict as E
+    from app import server as S
+
+    assert A.EcdictStore is E.EcdictStore is S.EcdictStore
+    assert A.fill_from_ecdict is E.fill_from_ecdict is S.fill_from_ecdict
+    assert A.HIGH_PRIORITY == S.COLLECT_JOB_PRIORITY
