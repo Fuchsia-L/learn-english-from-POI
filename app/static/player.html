@@ -409,7 +409,7 @@ async function api(path, opts){
   }
   return r.json();
 }
-/* 词典释义里的分隔符是字面两个字符 "\\n"（见 build_ecdict._clean_text），
+/* 词典释义里的分隔符是字面两个字符 "\n"（见 build_ecdict._clean_text），
    顺手也吃真换行。 */
 function glossLines(g){
   return String(g == null ? "" : g).split(/\\n|\n/)
