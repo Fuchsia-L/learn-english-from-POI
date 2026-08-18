@@ -50,7 +50,8 @@ scripts/
   —— 客观词典条目缓存（来自 ECDICT），与用户行为无关
 - `WordForm(surface, lexeme_id, note)`  —— surface 统一小写
 - `VocabEntry(id, lexeme_id, added_at, note?)`  —— 用户收藏了什么
-- `Encounter(id, vocab_entry_id, segment_id, surface, added_at)`
+- `Encounter(id, vocab_entry_id, segment_id?, surface, added_at, source_kind, context_json?)`
+  —— v0.4 泛化:source_kind=segment|web;web 来源 segment_id 为空,context_json 存 {url,title,sentence}
 - `AnnotationJob(id, lexeme_id, status, priority, created_at, done_at?)`
   status: queued/running/done/failed —— 异步任务状态，与收藏解耦
 - `Mnemonic(id, lexeme_id, kind, payload_json, provider, version, edited_by_user)`
@@ -67,6 +68,8 @@ scripts/
   **性能红线：本地 P50 < 50ms**（纯 SQLite，不碰 LLM）
 - `POST /collect` {surface, segment_id} → Lexeme(缺则建) + VocabEntry + Encounter
   + AnnotationJob(高优先级)
+- `POST /collect/web` {surface, sentence, url, title} → 同上链路,Encounter 记 web 来源
+  (浏览器划词插件专用;CORS 仅对扩展 origin 放行本端点与 /lookup)
 - `GET /vocab` → 生词本（lexeme 卡 + encounters 展开）
 - `GET /mnemonic?lexeme_id=` → done 则返回内容，否则返回 job status（前端轮询）
 
