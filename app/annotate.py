@@ -19,7 +19,7 @@
    schema；缺 id / id 不在本批 / 重复 id / 不合 schema 的元素丢弃，对应任务下一轮
    只重试没对上的那些；
 4. 写 Mnemonic：context_gloss 单独一行 kind="gloss"，每个 hook 按 type 拆行存；
-   version 递增；**edited_by_user=1 的那个 kind 永不覆盖**；
+   version 递增；**edited_by_user=1 的那个 kind 永不被覆盖**；
 5. job 置 done / failed（重试 --retries 次后仍失败才置 failed）。
 
 预算制（工单 6-1 修）：estimate_cost 的累计与 --budget 检查发生在**每一次真实
@@ -50,8 +50,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from app.consts import COLLECT_JOB_PRIORITY, DEFAULT_DB, DEFAULT_ECDICT
-from app.db import get_conn, init_db
+from app.consts import (
+    COLLECT_JOB_PRIORITY,
+    DEFAULT_DB,
+    DEFAULT_ECDICT,
+    WEB_EPISODE,
+)
+from app.db import ENCOUNTER_SELECT, SOURCE_WEB, encounter_view, get_conn, init_db
 
 # ECDICT 查询口径（word_lower + 优先本身小写那条）与 pos/释义取法只有一份实现，
 # 住在 app/ecdict.py（工单 9 抽层）：worker 与 server 共用，且 worker **不再
@@ -252,16 +257,31 @@ class AnnotateWorker:
 
     # --- 组装输入包（DESIGN §5 输入形状） ----------------------------------
 
-    def _latest_encounter(self, lexeme_id: int) -> sqlite3.Row | None:
-        return self.conn.execute(
-            "SELECT E.surface, S.text_en, S.t_start, C.season_ep, C.id AS content_id "
-            "FROM Encounter E "
-            "JOIN VocabEntry V ON V.id = E.vocab_entry_id "
-            "JOIN Segment S ON S.id = E.segment_id "
-            "JOIN Content C ON C.id = S.content_id "
-            "WHERE V.lexeme_id = ? ORDER BY E.id DESC LIMIT 1",
+    def _latest_encounter(self, lexeme_id: int) -> dict[str, Any] | None:
+        """最近一条**有原句**的 encounter（字幕段或网页划词，工单 11）。
+
+        为什么不是"最近一条"：网页收藏偶尔截不到整句（sentence 为空），
+        那条不该把上一次有原句的语境挤掉——模型没句子就只能瞎编。
+        网页来源的 episode 固定写 "web"，时间戳无意义（None）。
+        """
+        rows = self.conn.execute(
+            ENCOUNTER_SELECT
+            + "JOIN VocabEntry V ON V.id = E.vocab_entry_id "
+            "WHERE V.lexeme_id = ? ORDER BY E.id DESC LIMIT 20",
             (lexeme_id,),
-        ).fetchone()
+        ).fetchall()
+        for r in rows:
+            view = encounter_view(r)
+            if not view["sentence"]:
+                continue
+            web = view["source_kind"] == SOURCE_WEB
+            return {
+                "surface": view["surface"],
+                "sentence": view["sentence"],
+                "t_start": None if web else view["t_start"],
+                "episode": WEB_EPISODE if web else view["season_ep"],
+            }
+        return None
 
     def _any_segment_with(self, lemma: str) -> sqlite3.Row | None:
         """预热词没有 encounter：拿当集任一含该词的字幕段当原句。
@@ -295,8 +315,8 @@ class AnnotateWorker:
 
         enc = self._latest_encounter(job.lexeme_id)
         if enc is not None:
-            surface, sentence = enc["surface"], enc["text_en"]
-            t, episode = enc["t_start"], enc["season_ep"]
+            surface, sentence = enc["surface"], enc["sentence"]
+            t, episode = enc["t_start"], enc["episode"]
         else:
             seg = self._any_segment_with(lemma)
             surface = lemma
@@ -728,7 +748,7 @@ def payload_sample(provider: Provider, packs: Sequence[dict], batch_size: int) -
     """provider **真会发出去**的请求体，离线组装：不发包、不读 key、不含鉴权头。
 
     上线前用它眼验两件最花钱的事：模型名对不对（--model 有没有真的透传到请求体）、
-    thinking 有没有关（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
+    thinking 有没有开（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
     想看正文用 provider.dump_prompt(batch)。provider 没有 payload()（比如 fake）
     就返回 None，调用方跳过这行。
     """
