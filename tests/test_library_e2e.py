@@ -204,7 +204,7 @@ def fill_import_form(page, ws: dict, title: str, season_ep: str, *, audio=True, 
 
 def test_library_tab_sits_next_to_play_and_vocab(player):
     tabs = player.eval_on_selector_all("#tabs button", "bs => bs.map(b => b.textContent)")
-    assert tabs == ["[ 播放 ]", "[ 内容库 ]", "[ 生词本 ]"]
+    assert tabs == ["[ 播放 ]", "[ 内容库 ]", "[ 生词本 ]", "[ 复习 ]"]   # 复习见工单 14
     set_view(player, "lib")
     assert player.locator("#view-lib").is_visible()
     assert player.locator("#view-play").is_hidden()
