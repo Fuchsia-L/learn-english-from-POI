@@ -167,7 +167,7 @@ class ConnRegistry:
     """可枚举的连接登记簿：每线程一条连接 → 登记 → 统一关闭。线程安全。
 
     （工单 9：原居 app/server.py 的 `_ConnRegistry`，因 EcdictStore 抽到
-    app/ecdict.py 而下沉到这里——连接管理本来就是 db 层的事。
+    app/ecdict.py 而下沉到这里——连接管理本来就是 db 层的事。）
 
     每线程一条的代价：threading.local 只够本线程自己关，进程要退出时够不着别的
     线程那些连接 —— Windows 上就表现为 .db 文件被锁住、删不掉也重建不了（工单 6-4）。
