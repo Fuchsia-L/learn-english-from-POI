@@ -881,6 +881,7 @@ def test_vocab_mixes_web_and_subtitle_encounters(client: TestClient, env: dict):
     assert sub["source_kind"] == "segment"
     assert sub["sentence"] == segs[0]["text_en"] and sub["season_ep"] == "s01e01"
     assert sub["content_id"] == env["content_id"] and sub["url"] is None
+
     assert web["source_kind"] == "web"
     assert web["sentence"] == "Two homes burned down."
     assert web["title"] == WEB_TITLE and web["url"] == WEB_URL

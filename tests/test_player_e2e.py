@@ -563,7 +563,7 @@ def test_view_tabs_switch_and_video_state_is_restored(player):
     set_view(player, "vocab")                       # 切走：自动暂停
     assert player.locator("#view-play").is_hidden()
     assert player.evaluate("document.getElementById('video').paused") is True
-    # 生词本界面是全屏的，播放界面的顶栏控件跟着收起来
+    # 生词本界面是全屏的，播放界面的顶栏控件跟着收起
     assert player.locator("#modes").is_hidden()
     assert player.locator("#ep").is_hidden()
 
