@@ -9,7 +9,9 @@
 - [x] 本地词典 (`scripts/build_ecdict.py`) — ECDICT 77 万词条 → `data/ecdict.db`（音标/中文释义/考试标签/词形变换）
 - [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 多界面（播放 / 生词本）+ 字幕三档 + 忽略白色的自然模糊遮罩 + OCR 词框热区 + 查询卡 + 助记展示
 - [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
-- [ ] 生词本与复习
+- [x] 预热词表 (`scripts/build_cet46.py`) — CET4+CET6 大纲词表 → `data/cet46.txt`（lemma 归一、去重）
+- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 最近 7 天滚动 + 会/不会 + 毕业规则，纯 SQLite、不碰 LLM
+- [ ] 复习界面（播放器的第三个 tab；后端接口已就绪，UI 还没接）
 
 核心原则:LLM 只产语义,代码管装配和钱;词元(lexeme)为主键,encounter 记录每次真实语境;按需生产,看到哪集造到哪集。
 
@@ -47,6 +49,34 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 `/segments?content_id=`、`/lookup?surface=&segment_id=`、`POST /collect`、`/vocab`、
 `/mnemonic?lexeme_id=`；`/` 重定向到 `/static/player.html`。全程本地 SQLite，无网络调用；
 `data/ecdict.db` 缺失时 `/lookup` 降级为 `in_dict=false` 而不报错。
+
+ECDICT 的查询/回填口径住在 `app/ecdict.py`，`app/server.py` 和 `app/annotate.py` 共用
+同一份实现——worker 不 import web 层（`import app.annotate` 不会拖进 fastapi），
+跨模块共享常量（默认路径、任务优先级）在 `app/consts.py`。
+
+### 复习接口（M1 后端，UI 还没接）
+
+```bash
+curl 'http://127.0.0.1:8000/review/next?limit=20'
+curl -X POST http://127.0.0.1:8000/review/answer \
+     -H 'content-type: application/json' \
+     -d '{"vocab_entry_id": 1, "result": "know"}'     # result: know | dont
+curl http://127.0.0.1:8000/review/stats
+```
+
+规则全写在 `app/review.py` 的常量里（改规则只改常量，接口会把 `rules` 一起吐出来）：
+
+- **进队**：未毕业 且 今天（UTC 日）还没复习过 且（`added_at` 在最近
+  `REVIEW_WINDOW_DAYS = 7` 天内 **或** 历史上答过一次 `dont`）——错过的词一直跟着你。
+- **排序**：从未复习过的最优先，其次上次复习时间最早的优先（同档按收藏早、id 小）。
+- **毕业**：末尾连续 `GRADUATE_STREAK = 2` 次 `know`，且**最后一次复习**距首次收藏
+  ≥ `GRADUATE_MIN_AGE_DAYS = 3` 天。当天收藏当天连点两次不算毕业。
+- **幂等**：同一天对同一张卡重复提交同一个 `result` 不再插行（返回 `duplicate: true`）；
+  同一天改答另一个 result 会记录（用户改口是真实信息）。
+- 时间一律 UTC ISO8601 存 `Review.at`；`/review/stats` 的「今天」= UTC 日历日。
+- `/review/next` 的卡片含 lemma / 音标 / 词典释义 / 最近一次 encounter 原句（可跳回定位）
+  / 助记就绪状态（`mnemonic_status` + `has_mnemonic`）；`remaining` 是整个队列长度，
+  不受 `limit` 影响。**不做 FSRS**（DESIGN §7）。
 
 ## player：单文件播放器
 
@@ -184,9 +214,27 @@ DeepSeek 默认模型是 **`deepseek-v4-flash`**（旧的 `deepseek-chat` / `dee
 估价一律按**峰时 + cache-miss**（牌价最贵那档）算 —— 预算是硬顶，不许乐观估。
 按默认 `--batch-size 4` 算下来约 **¥0.0039/词**，¥4 预算够跑 ~1000 个词。
 
+## build_cet46：预热词表
+
+```bash
+python scripts/build_cet46.py                     # 克隆公开词表仓库 → data/cet46.txt（用完删克隆）
+python scripts/build_cet46.py --source /tmp/wordlists/CET4_edited.txt \
+                              --source /tmp/wordlists/CET6_edited.txt   # 离线/自备词表
+python scripts/build_cet46.py --dry-run           # 只统计不写
+```
+
+数据源是 GitHub 公开仓库 `mahavivo/english-wordlists` 的 `CET4_edited.txt` +
+`CET6_edited.txt`（四/六级大纲词表）。每行取行首英文词（吃得下 `instruct[ inˈstrʌkt]`
+这种少空格的、`toward(s)`/`systematic(al)` 这种可选后缀的、`oˈclock` 这种怪撇号的），
+丢掉中文标题行和字母分节头，然后**用 `app.ingest` 同一套 `normalize_surface` +
+`lemmatize` 归一**——不然词表里的词和 `Segment.tokens_json` 里的 lemma 对不上。
+实测：CET4 抽出 4536 词 → 4476 lemma，CET6 抽出 2219 词 → 只新增 1174（两表重叠 1045），
+合计 **5650** 个 lemma。联网失败会打印手工克隆 + `--source` 的重试方式并以非零码退出。
+
 ## prefetch：预热入队
 
 ```bash
+python scripts/build_cet46.py                    # 先有词表
 python scripts/prefetch.py --db data/poi.db --content-id 1 \
     --wordlist data/cet46.txt --limit 200
 python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --once --budget 4.0
@@ -194,8 +242,9 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db --once --budget 
 
 当集 lemma ∩ 词表 → 按 wordfreq 词频降序 → 低优先级（0）入队；已 queued/running/done
 的词跳过（失败过的允许重排），重复跑幂等。`data/cet46.txt` 不存在时会打印生成方法
-（从 `data/ecdict.db` 的 `tag` 字段一条命令导出 CET4/6 词表）并以非零码退出。
-`--dry-run` 只算不写。
+（`scripts/build_cet46.py`，或从 `data/ecdict.db` 的 `tag` 字段导）并以非零码退出。
+`--dry-run` 只算不写。2 分钟真实片段实测：当集 144 个 lemma、命中词表 124 个、
+入队 123 个（1 个已有任务跳过）。
 
 ## extract_hardsub.py
 
