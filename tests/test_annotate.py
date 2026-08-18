@@ -503,7 +503,7 @@ def test_budget_stops_mid_batch_retry_and_requeues(env: dict, logs: list):
     assert job_status(env["db"], job)["status"] == "queued"
 
 
-# --- 重试 / 失败 -------------------------------------------------------------
+# --- 重试 / 失败 ------------------------------------------------------------
 
 
 def test_retry_then_success(env: dict, logs: list):
