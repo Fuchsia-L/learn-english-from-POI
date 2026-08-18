@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>POI // 学词终端</title>
-<!-- 内联 data-URI favicon：16x16 单色琪珀方块。纯粹为了让浏览器别再去要
+<!-- 内联 data-URI favicon：16x16 单色琥珀方块。纯粹为了让浏览器别再去要
      /favicon.ico（那个 404 在 Edge / E2E 控制台里刷屏）。不新增静态文件。 -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20fill='%23ffb454'/%3E%3C/svg%3E">
 <!--
@@ -22,7 +22,7 @@
   --fg:#c3d2dd;
   --dim:#61758a;
   --acc:#3ff08a;       /* 终端绿 */
-  --amber:#ffb454;     /* 琪珀 */
+  --amber:#ffb454;     /* 琥珀 */
   --white:#e9f2f7;     /* POI 监视白框 */
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
           "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
@@ -130,7 +130,7 @@ main{padding:16px; max-width:1680px; margin:0 auto}
 .mask.cssblur{border-top:1px solid rgba(255,255,255,.05)}
 #maskcv{
   display:block; position:absolute; left:0; width:100%;
-  /* top / height 由 JS 按取样区设（比遮罩带高出 PAD 行，多出来的被裁掉。
+  /* top / height 由 JS 按取样区设（比遮罩带高出 PAD 行，多出来的被裁掉）。
      小画布 CSS 放大（浏览器插值）+ 轻微模糊：块感抹平，像画面自然延续。 */
   filter:blur(9px) saturate(.98);
   transform:scaleX(1.03);       /* 横向撑一点，别让模糊在左右边缘咬出透明缝 */
@@ -138,7 +138,7 @@ main{padding:16px; max-width:1680px; margin:0 auto}
 }
 .mask.cssblur #maskcv{display:none}
 
-/* 词框热区：平时全透明，hover 才描白框（机器盐睳） */
+/* 词框热区：平时全透明，hover 才描白框（机器盯梢） */
 .hot{
   position:absolute; pointer-events:auto; cursor:pointer;
   border:1px solid transparent; border-radius:1px;
@@ -342,7 +342,7 @@ var CONF = {
   EN_BAND: [1026, 1080],   // 英文行（烧录字幕，热区盖这里）
   HOT_PAD: 3,              // 热区四周外扩（参考帧像素），便于点中
   BOX_MIN_RATIO: 0.5,      // 有效词框比例低于此值 → 该段走自渲染退路
-  SYNC_MS: 120,            // 兵底轮询（timeupdate 约 4Hz，不够跟手）
+  SYNC_MS: 120,            // 兜底轮询（timeupdate 约 4Hz，不够跟手）
 
   /* 遮罩：canvas 高亮抑制（"忽略白色"的自然模糊，不是黑条）。
      取样时向带外多取 PAD 行——那几行在字幕之上、必定没有字，正好当"背景"。
@@ -414,7 +414,7 @@ function glossLines(g){
     .map(function(s){ return s.trim(); })
     .filter(function(s){ return s.length > 0; });
 }
-/* 与服务端 _clean_surface 同口径：小写 + 撞号归一 + 剥首尾标点 */
+/* 与服务端 _clean_surface 同口径：小写 + 撇号归一 + 剥首尾标点 */
 function normSurface(raw){
   var s = String(raw == null ? "" : raw).toLowerCase()
     .replace(/[’ʼ]/g, "'");
@@ -526,7 +526,7 @@ var MK = {
 function markMaskDirty(){ S.maskDirty = true; }
 
 /* 首选 requestVideoFrameCallback：它只在新帧真正上屏时回调，
-   播放中、暂停后 seek 都准。挂不上就靠 seek 后补几枪 + 兵底轮询。 */
+   播放中、暂停后 seek 都准。挂不上就靠 seek 后补几枪 + 兜底轮询。 */
 function hookVideoFrames(){
   if (typeof video.requestVideoFrameCallback !== "function") return;
   MK.rvfc = true;
@@ -672,7 +672,7 @@ function paintMask(force){
   cv.dataset.frames = String(MK.frames);
   cv.dataset.pad = String(padRows);
 
-  // 性能红线：连续超预算就降级，绝不为了好看拖垃播放
+  // 性能红线：连续超预算就降级，绝不为了好看拖垮播放
   MK.over = ms > M.BUDGET_MS ? MK.over + 1 : 0;
   if (MK.over >= M.OVER_LIMIT) degradeMask("单帧处理超 " + M.BUDGET_MS + "ms");
   window.__maskStats = { frames: MK.frames, lastMs: MK.lastMs, avgMs: MK.avgMs,
@@ -1366,7 +1366,7 @@ document.addEventListener("keydown", function(ev){
   else if (!play) return;                          // 以下都是播放界面的键
   else if (ev.key === "1" || ev.key === "2" || ev.key === "3") { setMode(Number(ev.key)); ev.preventDefault(); }
   else if (ev.key === " ") {
-    // 焦点还在按钮上时，空格会顺带再激活那个按钮一次 → 先摸掉焦点
+    // 焦点还在按钮上时，空格会顺带再激活那个按钮一次 → 先摘掉焦点
     if (t && t.tagName === "BUTTON") t.blur();
     togglePlay();
     ev.preventDefault();
