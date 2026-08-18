@@ -68,6 +68,27 @@ python -m app.annotate --db data/poi.db --provider deepseek --once --dry-run
 
 提示词在 `app/providers/prompts.py`，想调助记口味只改这一个文件。
 
+预热（可选）：先建 CET4+CET6 词表，再把当集命中的词按词频降序低优先级入队——
+点击收藏的词永远插在它们前面。
+
+```bash
+python scripts/build_cet46.py                                   # → data/cet46.txt（约 5.6k 词）
+python scripts/prefetch.py --db data/poi.db --content-id 1 --limit 200
+```
+
+## 6. 复习（M1 后端，界面还没接）
+
+```bash
+curl 'http://127.0.0.1:8000/review/next?limit=20'                       # 今日待复习卡
+curl -X POST http://127.0.0.1:8000/review/answer -H 'content-type: application/json' \
+     -d '{"vocab_entry_id": 1, "result": "know"}'                       # know / dont
+curl http://127.0.0.1:8000/review/stats                                 # 今日已复习/待复习/毕业
+```
+
+规则：最近 7 天收藏的词 + 答错过还没毕业的词进队；连续 2 次 `know` 且最后一次复习
+距首次收藏 ≥3 天就毕业、不再出现；同一天重复提交同一答案幂等。改规则改
+`app/review.py` 顶部的常量即可。
+
 ## 故障排查
 
 - 播放器提示库里没内容 → 第 3 步没跑或 --db 路径不一致（服务端读 POI_DB，默认 data/poi.db）。
