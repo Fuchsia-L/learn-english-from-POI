@@ -11,9 +11,11 @@ anthropic_api.py / deepseek.py 只需要填四件事：端点、鉴权头、请�
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
 from app.providers import (
@@ -82,6 +84,114 @@ def parse_json_array(text: str) -> list:
     return data
 
 
+# --- 牌价（工单 16-2：一个结构 + 元数据 + 可覆盖 + 非法即 fail closed） -----
+
+
+class PriceConfigError(ProviderError):
+    """牌价配置非法（覆盖值是负数 / NaN / 非数，或子类根本没填牌价）。
+
+    **不可重试**，而且故意让它从 estimate_cost 里抛出去：worker 的
+    `_estimate` 把估价异常一律当"估价不可用"处理（工单 8b 的 fail closed
+    路径），于是配错价 = 一分钱都不花地停手，而不是按一个瞎猜的数照跑。
+    """
+
+
+@dataclass(frozen=True)
+class Price:
+    """一份牌价 + 它的来龙去脉。
+
+    单价单位固定是 **currency / 百万 token**。带 `as_of` 是因为牌价是**某一天
+    抄下来的一个数**，不是常识：不把日期摆在明面上，半年后没人知道该不该信它。
+    """
+
+    input_per_mtok: float
+    output_per_mtok: float
+    currency: str = "CNY"
+    source: str = "official price page"
+    as_of: str = "2026-08-16"
+    note: str = "估算用，以官方现价为准"
+
+    @property
+    def symbol(self) -> str:
+        return {"CNY": "¥", "USD": "$"}.get(self.currency, f"{self.currency} ")
+
+    def label(self) -> str:
+        """一行人话，dry-run / 日志里直接打印。"""
+        s = self.symbol
+        return (
+            f"输入 {s}{self.input_per_mtok:g} / 输出 {s}{self.output_per_mtok:g} "
+            f"每百万 token（{self.currency}；来源: {self.source}；"
+            f"as_of={self.as_of}；{self.note}）"
+        )
+
+    def stamp(self) -> str:
+        """极短版：只给 as_of，塞进已经很长的日志行。"""
+        return f"牌价 as_of={self.as_of}"
+
+    def as_dict(self) -> dict:
+        return {
+            "input_per_mtok": self.input_per_mtok,
+            "output_per_mtok": self.output_per_mtok,
+            "currency": self.currency,
+            "source": self.source,
+            "as_of": self.as_of,
+            "note": self.note,
+        }
+
+    def validated(self, where: str = "牌价") -> "Price":
+        """单价必须是有限非负实数，否则抛 PriceConfigError。"""
+        for field, value in (
+            ("input_per_mtok", self.input_per_mtok),
+            ("output_per_mtok", self.output_per_mtok),
+        ):
+            _check_price_number(value, f"{where}.{field}")
+        return self
+
+
+def _check_price_number(value: Any, where: str) -> float:
+    if isinstance(value, bool) or value is None:
+        raise PriceConfigError(f"{where} 非法: {value!r}（不是数）")
+    try:
+        val = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PriceConfigError(f"{where} 非法: {value!r}（转不成数字: {exc}）") from exc
+    if math.isnan(val) or math.isinf(val):
+        raise PriceConfigError(f"{where} 非法: {val}（NaN/inf）")
+    if val < 0:
+        raise PriceConfigError(f"{where} 非法: {val}（负数）")
+    return val
+
+
+# 子类没填牌价时的占位：估价时会被 validated() 之外的显式检查拦下来
+UNPRICED = Price(0.0, 0.0, source="未填", as_of="未填", note="子类必须覆盖 price")
+
+
+class CostEstimate(float):
+    """估价结果：值就是钱（float，老调用方完全无感），另挂着这次用的牌价。
+
+    工单 16-2 要求"estimate_cost 的输出带 as_of 标注"。返回类型仍是 float 的
+    子类，所以 `float(est)`、`est > budget`、`f"{est:.4f}"`、`math.isnan(est)`
+    一律照旧，只是多了 `.price` / `.as_of` 能问。
+    """
+
+    price: Price
+
+    def __new__(cls, value: float, price: Price) -> "CostEstimate":
+        obj = super().__new__(cls, value)
+        obj.price = price
+        return obj
+
+    @property
+    def as_of(self) -> str:
+        return self.price.as_of
+
+    def label(self) -> str:
+        return f"{self.price.symbol}{float(self):.6f}（{self.price.label()}）"
+
+    def __repr__(self) -> str:  # 日志里打出来自带日期
+        return f"CostEstimate({float(self)!r}, {self.price.stamp()})"
+
+
 class ChatJSONProvider:
     """聊天补全型 provider 的共同实现。子类填空即可。"""
 
@@ -89,9 +199,12 @@ class ChatJSONProvider:
     env_var = ""  # 例：ANTHROPIC_API_KEY
     endpoint = ""
     model = ""
-    # 牌价：人民币元 / 百万 token。子类覆盖；随时可能过期，自己核对官网。
-    price_in_cny_per_mtok = 0.0
-    price_out_cny_per_mtok = 0.0
+    # 牌价：一个 Price 结构（单价 + currency + source + as_of + note）。子类必填。
+    # 随时可能过期 —— as_of 就是给这件事留的把手。
+    price: Price = UNPRICED
+    # 环境变量覆盖前缀：设了就认 f"{prefix}_IN" / f"{prefix}_OUT"
+    # （例：POI_DEEPSEEK_PRICE_IN=2.4 POI_DEEPSEEK_PRICE_OUT=7.2）
+    price_env_prefix = ""
     # 每个词条预留的输出 token（一条 gloss + 至多 3 条 hook 的经验值）
     out_tokens_per_item = 220
 
@@ -126,6 +239,90 @@ class ChatJSONProvider:
     @property
     def api_key(self) -> str | None:
         return self._api_key or os.environ.get(self.env_var) or None
+
+    # --- 牌价 --------------------------------------------------------------
+
+    def _legacy_price(self) -> Price | None:
+        """兼容老式写法：子类直接把两个 float 挂在类上（而不是给 Price）。
+
+        本类把 price_in/out_cny_per_mtok 变成了只读属性，子类若仍用类属性覆盖，
+        属性查找会先命中子类的那个数——这时按它们造一份 Price，别让老代码摔。
+        """
+        vals = []
+        for attr in ("price_in_cny_per_mtok", "price_out_cny_per_mtok"):
+            raw = getattr(type(self), attr, None)
+            if isinstance(raw, property):  # 没被子类覆盖，走新结构
+                return None
+            vals.append(raw)
+        return Price(
+            input_per_mtok=_check_price_number(vals[0], f"{self.name}.price_in_cny_per_mtok"),
+            output_per_mtok=_check_price_number(vals[1], f"{self.name}.price_out_cny_per_mtok"),
+            source="子类的 price_in/out_cny_per_mtok 类属性（老式写法）",
+            as_of="未标注",
+            note="估算用，以官方现价为准",
+        )
+
+    def base_price(self) -> Price:
+        """子类填的那份牌价（未经环境变量覆盖）。没填 / 形状不对就抛。"""
+        legacy = self._legacy_price()
+        if legacy is not None:
+            return legacy
+        price = self.price
+        if not isinstance(price, Price):
+            raise PriceConfigError(
+                f"{self.name}: price 应该是 Price 结构，实际是 {type(price).__name__}"
+            )
+        if price is UNPRICED:
+            raise PriceConfigError(
+                f"{self.name}: 没有牌价（price 没被子类覆盖），估价不可用"
+            )
+        return price
+
+    def resolved_price(self) -> Price:
+        """真正用于估价的牌价 = 子类牌价 + 环境变量覆盖，并且**校验过**。
+
+        覆盖口径（工单 16-2）：`{price_env_prefix}_IN` / `_OUT`，单位与牌价一致
+        （currency / 百万 token），两个可以只设一个。值非法（负数 / NaN / 非数 /
+        空串）一律抛 PriceConfigError —— 估价失败按 fail closed 处理，不许拿一个
+        看不懂的数去花钱。
+        """
+        price = self.base_price().validated(f"{self.name} 牌价")
+        prefix = self.price_env_prefix
+        if not prefix:
+            return price
+        names = (f"{prefix}_IN", f"{prefix}_OUT")
+        raw_in, raw_out = (os.environ.get(n) for n in names)
+        if raw_in is None and raw_out is None:
+            return price
+        used = [n for n, v in zip(names, (raw_in, raw_out)) if v is not None]
+        return replace(
+            price,
+            input_per_mtok=(
+                price.input_per_mtok if raw_in is None
+                else _check_price_number(raw_in.strip(), names[0])
+            ),
+            output_per_mtok=(
+                price.output_per_mtok if raw_out is None
+                else _check_price_number(raw_out.strip(), names[1])
+            ),
+            source=f"环境变量 {'+'.join(used)} 覆盖（原: {price.source}）",
+            as_of=f"env-override（表内原值 as_of={price.as_of}）",
+            note=f"覆盖值来自本机环境变量；{price.note}",
+        )
+
+    def price_label(self) -> str:
+        """一行牌价说明（含 as_of），给 dry-run / 启动日志打印。"""
+        return self.resolved_price().label()
+
+    @property
+    def price_in_cny_per_mtok(self) -> float:
+        """老名字，等于 resolved_price().input_per_mtok（含环境变量覆盖）。"""
+        return self.resolved_price().input_per_mtok
+
+    @property
+    def price_out_cny_per_mtok(self) -> float:
+        """老名字，等于 resolved_price().output_per_mtok（含环境变量覆盖）。"""
+        return self.resolved_price().output_per_mtok
 
     @property
     def configured(self) -> bool:
@@ -183,17 +380,23 @@ class ChatJSONProvider:
         assert last is not None
         raise last
 
-    def estimate_cost(self, batch: list[dict]) -> float:
-        """预估这一批的花费（人民币元）。不发请求，离线可算。"""
+    def estimate_cost(self, batch: list[dict]) -> CostEstimate:
+        """预估这一批的花费。不发请求，离线可算。
+
+        返回的是 float 子类 CostEstimate：数值照常参与预算比较，另外挂着这次用的
+        Price（`.as_of` / `.price.label()`），好让"这是某天的牌价"一直跟着结果走。
+        牌价配置非法时抛 PriceConfigError —— worker 会按估价不可用停手（工单 8b）。
+        """
+        price = self.resolved_price()
         if not batch:
-            return 0.0
+            return CostEstimate(0.0, price)
         prompt = SYSTEM_PROMPT + build_user_prompt(batch)
         tin = approx_tokens(prompt)
         tout = self.out_tokens_per_item * len(batch)
         cost = (
-            tin * self.price_in_cny_per_mtok + tout * self.price_out_cny_per_mtok
+            tin * price.input_per_mtok + tout * price.output_per_mtok
         ) / 1_000_000
-        return round(cost, 6)
+        return CostEstimate(round(cost, 6), price)
 
     # --- HTTP --------------------------------------------------------------
 
