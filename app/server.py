@@ -17,6 +17,9 @@
   lifespan 退出时统一 close（Windows 不锁库文件）。
 - 复习闭环（M1）：规则与 SQL 住在 **app/review.py**（纯 SQLite），本模块只做
   HTTP 壳子 —— /review/next、/review/answer、/review/stats。
+- 剧集导入（工单 12）：ffprobe 校验 / ffmpeg 合并 / 原子 ingest 住在
+  **app/library.py**，本模块只负责收 multipart（逐块写盘）、起后台线程、
+  吐作业状态 —— POST /import、GET /import/{job_id}。
 """
 
 from __future__ import annotations
@@ -26,18 +29,25 @@ import mimetypes
 import os
 import re
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from app import library as lib
 from app import review as review_rules
-from app.consts import COLLECT_JOB_PRIORITY, DEFAULT_DB, DEFAULT_ECDICT
+from app.consts import (
+    COLLECT_JOB_PRIORITY,
+    DEFAULT_DB,
+    DEFAULT_ECDICT,
+    LIBRARY_DIRNAME,
+)
 from app.db import (
     ENCOUNTER_SELECT,
     SOURCE_SEGMENT,
@@ -303,10 +313,18 @@ class ReviewAnswerIn(BaseModel):
 def create_app(
     db_path: str | Path | None = None,
     ecdict_path: str | Path | None = None,
+    library_path: str | Path | None = None,
 ) -> FastAPI:
-    """建 app。参数优先，其次环境变量 POI_DB / POI_ECDICT，最后默认值。"""
+    """建 app。参数优先，其次环境变量 POI_DB / POI_ECDICT / POI_LIBRARY，最后默认值。"""
     db_file = Path(db_path or os.environ.get("POI_DB") or DEFAULT_DB)
     ecdict_file = Path(ecdict_path or os.environ.get("POI_ECDICT") or DEFAULT_ECDICT)
+    # 导入的媒体落在 <poi.db 所在目录>/library/<uuid>/（默认 data/library/，
+    # data/ 整个在 .gitignore 里，版权素材不会进仓库）
+    library_dir = Path(
+        library_path
+        or os.environ.get("POI_LIBRARY")
+        or lib.library_root(db_file, LIBRARY_DIRNAME)
+    )
 
     # 建表在首个请求触发（Database._ensure_schema，幂等）——import 阶段不碰磁盘
     db = Database(db_file)
@@ -334,6 +352,8 @@ def create_app(
     app.state.ecdict = ecdict
     app.state.db_path = db_file
     app.state.ecdict_path = ecdict_file
+    app.state.library_path = library_dir
+    app.state.imports = lib.ImportRegistry()
 
     # CORS：只给划词插件的两个端点开口子（工单 11，实现见 ExtensionCORS）
     app.add_middleware(ExtensionCORS)
@@ -353,16 +373,33 @@ def create_app(
 
     @app.get("/episodes")
     def episodes() -> dict:
+        """选集下拉 + 「内容库」界面共用的一份清单（工单 12）。
+
+        除了播放必须的字段，还带上内容库要显示的：有没有词框、媒体在不在、
+        有没有音轨。音轨信息来自导入时写的 meta.json sidecar —— 列表页不能
+        每次都去 ffprobe 一遍全部剧集（几十集就是几十次进程启动）。
+        """
         conn = db.conn()
         rows = conn.execute(
             "SELECT C.id, C.title, C.season_ep, C.video_path, C.srt_path,"
-            "       COUNT(S.id) AS n_segments, COALESCE(MAX(S.t_end), 0) AS duration "
+            "       COUNT(S.id) AS n_segments, COALESCE(MAX(S.t_end), 0) AS duration,"
+            "       SUM(CASE WHEN S.word_boxes_json IS NOT NULL THEN 1 ELSE 0 END)"
+            "         AS n_boxes "
             "FROM Content C LEFT JOIN Segment S ON S.content_id = C.id "
             "GROUP BY C.id ORDER BY C.title, C.season_ep"
         ).fetchall()
         out = []
         for r in rows:
-            video_path = r["video_path"]
+            video_path = Path(r["video_path"]) if r["video_path"] else None
+            size = 0
+            try:  # 文件可能刚被删/挂载点没了：列表页不该因此 500
+                size = video_path.stat().st_size if video_path else 0
+            except OSError:
+                size = 0
+            exists = bool(video_path) and video_path.is_file()
+            meta = lib.read_meta(video_path.parent) if video_path else None
+            if meta is not None and meta.get("content_id") not in (None, r["id"]):
+                meta = None  # 目录被复用/搬走过，元数据对不上就当没有
             out.append(
                 {
                     "id": r["id"],
@@ -370,11 +407,122 @@ def create_app(
                     "season_ep": r["season_ep"],
                     "segments": r["n_segments"],
                     "duration": round(float(r["duration"]), 3),
-                    "has_video": bool(video_path) and Path(video_path).exists(),
+                    "has_video": exists,
                     "media_url": f"/media/{r['id']}",
+                    "boxes_segments": int(r["n_boxes"] or 0),
+                    "has_boxes": int(r["n_boxes"] or 0) > 0,
+                    "media_name": video_path.name if video_path else None,
+                    "media_missing": bool(video_path) and not exists,
+                    "media_size": size if exists else 0,
+                    # True/False 来自导入登记；老数据（CLI ingest 的）没登记 → null
+                    "has_audio": (meta or {}).get("has_audio"),
+                    "imported_at": (meta or {}).get("imported_at"),
+                    "warnings": list((meta or {}).get("warnings") or []),
                 }
             )
         return {"episodes": out}
+
+    # ---- POST /import  （剧集导入，工单 12） --------------------------------
+
+    @app.post("/import", status_code=202)
+    async def import_episode(
+        title: str = Form(...),
+        season_ep: str = Form(...),
+        video: UploadFile = File(...),
+        srt: UploadFile = File(...),
+        audio: UploadFile | None = File(None),
+        boxes: UploadFile | None = File(None),
+    ) -> dict:
+        """收上传 → 起后台线程跑流水线，立刻返回 job_id（前端轮询 /import/{id}）。
+
+        本函数只干两件事：把上传**逐块**落到 data/library/<uuid>/，以及挡掉
+        重复导入。校验/合并/入库全在 app/library.py 的后台线程里，因为 ffmpeg
+        合并一集是分钟级的，绝不能占着 HTTP 连接不放（浏览器早超时了）。
+        """
+        title = (title or "").strip()
+        season_ep = (season_ep or "").strip()
+        if not title or not season_ep:
+            raise HTTPException(status_code=400, detail="剧名和季/集编号都不能为空")
+
+        conn = db.conn()
+        dup = lib.content_exists(conn, title, season_ep)
+        if dup is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"《{title}》{season_ep} 已经导入过（content_id={dup}）；"
+                "换个季/集编号，或先把旧的删掉",
+            )
+
+        def _optional(u: UploadFile | None) -> UploadFile | None:
+            # 空的 <input type=file> 也会发一个 filename="" 的分片，别当真
+            return u if (u is not None and u.filename) else None
+
+        audio = _optional(audio)
+        boxes = _optional(boxes)
+        if _optional(video) is None or _optional(srt) is None:
+            raise HTTPException(status_code=400, detail="视频文件和 SRT 都是必填")
+
+        library_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = lib.new_work_dir(library_dir)
+        try:
+            paths: dict[str, Path] = {}
+            for key, upload, fallback in (
+                ("video", video, "video.mp4"),
+                ("audio", audio, "audio.m4a"),
+                ("srt", srt, "subtitle.srt"),
+                ("boxes", boxes, "boxes.json"),
+            ):
+                if upload is None:
+                    continue
+                dest = work_dir / lib.safe_name(upload.filename, fallback)
+                if dest.exists():  # 视频和音频重名（同名不同目录）时错开
+                    dest = dest.with_name(f"{key}_{dest.name}")
+                size = await lib.save_upload(upload, dest)
+                if size == 0:
+                    raise HTTPException(
+                        status_code=400, detail=f"{upload.filename} 是空文件"
+                    )
+                paths[key] = dest
+        except HTTPException:
+            lib.cleanup(work_dir)
+            raise
+        except OSError as exc:
+            lib.cleanup(work_dir)
+            raise HTTPException(status_code=500, detail=f"写入失败：{exc}") from exc
+
+        job = app.state.imports.create(title, season_ep, work_dir)
+        thread = threading.Thread(
+            target=lib.run_import,
+            args=(job,),
+            kwargs={
+                "conn_factory": db.conn,
+                "db_path": db_file,
+                "video_path": paths["video"],
+                "srt_path": paths["srt"],
+                "audio_path": paths.get("audio"),
+                "boxes_path": paths.get("boxes"),
+            },
+            name=f"import-{job.id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return job.as_dict()
+
+    # ---- GET /import/{job_id} ---------------------------------------------
+
+    @app.get("/import/{job_id}")
+    def import_status(job_id: str) -> dict:
+        job = app.state.imports.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"导入作业 {job_id} 不存在")
+        return job.as_dict()
+
+    # ---- GET /import  （最近几次导入，调试/刷新用） ------------------------
+
+    @app.get("/import")
+    def import_list() -> dict:
+        jobs = [j.as_dict() for j in app.state.imports.recent()]
+        return {"count": len(jobs), "jobs": jobs}
 
     # ---- GET /media/{content_id} （Range） --------------------------------
 
@@ -812,11 +960,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--db", default=os.environ.get("POI_DB", DEFAULT_DB))
     ap.add_argument("--ecdict", default=os.environ.get("POI_ECDICT", DEFAULT_ECDICT))
+    ap.add_argument(
+        "--library",
+        default=os.environ.get("POI_LIBRARY"),
+        help="导入的剧集落在哪儿（默认 <db 所在目录>/library）",
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args(argv)
 
-    application = create_app(db_path=args.db, ecdict_path=args.ecdict)
+    application = create_app(
+        db_path=args.db, ecdict_path=args.ecdict, library_path=args.library
+    )
     ecdict_note = "" if Path(args.ecdict).exists() else "  (缺失 → in_dict 恒为 false)"
     print(f"[server] db={args.db}  ecdict={args.ecdict}{ecdict_note}")
     print(f"[server] http://{args.host}:{args.port}/static/player.html")
