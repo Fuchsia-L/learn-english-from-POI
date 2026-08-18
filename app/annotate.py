@@ -13,7 +13,7 @@
 流程（一批一批来）:
 1. 取 queued 任务，**priority DESC, id ASC**（收藏 priority=10 插队，预热=0）；
 2. 组装输入包：lemma + ECDICT 音标/释义 + 最近一条 Encounter 的原句/时间戳/集数；
-   预热词没有 encounter，退回"当集任一含该词的 Segment 原句"；
+   预热词没有 encounter，退回“当集任一含该词的 Segment 原句”；
    每个包带 id = AnnotationJob.id（对位靠它，见第 3 条）；
 3. 按批调 provider.annotate()，输出**按 id 对回任务**（顺序无语义），逐条过 JSON
    schema；缺 id / id 不在本批 / 重复 id / 不合 schema 的元素丢弃，对应任务下一轮
@@ -27,6 +27,12 @@ provider 调用之前**（重试也算钱），不是每批只查一次——否
 ¥4 的预算烧成 ¥12。超限时低优先级任务原地停手、状态置回 queued 并计入
 skipped_budget；高优先级（priority >= 10）不受预算限制，但花费照记。
 
+估价 fail closed（工单 8b）：provider.estimate_cost 抛异常 / 返回 None / NaN /
+inf / 负数时，**本轮立即停手**——任务保持（或放回）queued，一次 provider 调用
+都不发，日志写明原因，进程退出码 3。不许再像以前那样“估价失败按 ¥0 处理”然后
+照跑不误。高优先级（点击收藏）同样停：估价系统坏了就是坏了，不确定成本时
+一分钱都不许花。
+
 健壮性：单个任务/单个批次炸掉只影响它自己，worker 不崩；provider 抛什么异常都接。
 本模块除 provider 外不发任何网络请求（provider=fake 时全程零网络）。
 """
@@ -35,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import time
@@ -66,6 +73,17 @@ DEFAULT_POLL = 5.0
 HIGH_PRIORITY = COLLECT_JOB_PRIORITY
 
 GLOSS_KIND = "gloss"
+
+# main() 的退出码：估价系统坏掉导致本轮停手（和普通失败区分开，方便脚本判断）
+EXIT_ESTIMATE_BROKEN = 3
+
+
+class EstimateUnavailable(RuntimeError):
+    """estimate_cost 坏了：抛异常 / 返回 None / NaN / inf / 负数（工单 8b）。
+
+    **绝不按 ¥0 处理**。不知道要花多少钱的时候一分钱都不许花——不管是预热的
+    低优先级任务还是用户点击收藏的高优先级任务，一律停手、任务留在 queued。
+    """
 
 
 def _now() -> str:
@@ -102,10 +120,12 @@ class RunStats:
     done: int = 0
     failed: int = 0
     skipped_budget: int = 0
+    skipped_estimate: int = 0  # 因估价不可用而没送出的任务（保持 queued，工单 8b）
     batches: int = 0
     calls: int = 0
     rows: int = 0
     est_cost: float = 0.0  # 已花估算（元）：每次真实 provider 调用前累加，含重试
+    estimate_broken: bool = False  # 本轮是否因估价系统坏掉而停手
 
     @property
     def spent(self) -> float:
@@ -146,6 +166,9 @@ class AnnotateWorker:
         self.content_id = content_id
         self.est_cost = 0.0  # 本次运行累计预估花费（元），每次真实调用前累加
         self._budget_logged = False
+        # 估价系统坏掉的闸门（工单 8b）：一旦置位，本轮**所有**优先级都停手
+        self.estimate_broken = False
+        self._estimate_logged = False
         self._log = log if log is not None else self._default_log
         self._sleep = sleep
         self._conn: sqlite3.Connection | None = None
@@ -390,8 +413,22 @@ class AnnotateWorker:
         """这次**真实调用**掏不掏得起？掏得起就当场记账（重试也计费）。
 
         高优先级（用户点击收藏）不受预算限制，但花费照记——否则 est_cost 会骗人。
+
+        估价本身坏掉（工单 8b）时返回 False 并置 self.estimate_broken：
+        这一票否决**不分优先级**，高优先级也停——估价系统坏了就是坏了。
         """
-        est = self._estimate(pending)
+        try:
+            est = self._estimate(pending)
+        except EstimateUnavailable as exc:
+            self.estimate_broken = True
+            stats.estimate_broken = True
+            if not self._estimate_logged:
+                self.log(
+                    f"估价不可用，**停止本轮处理**（绝不按 ¥0 继续）：{exc}；"
+                    f"任务保持 queued，修好 provider.estimate_cost 后重跑"
+                )
+                self._estimate_logged = True
+            return False
         if not any(j.high for j in pending) and self.est_cost + est > self.budget:
             if not self._budget_logged:
                 self.log(
@@ -408,11 +445,17 @@ class AnnotateWorker:
     def process_batch(self, batch: list[Job], stats: RunStats) -> bool:
         """一批的完整生命周期：running → 调用（含重试）→ 落库 → done/failed。
 
-        返回 True 表示**被预算卡住**了（本批没跑完的任务已置回 queued），
-        调用方应当停止再送低优先级任务。
+        返回 True 表示**没送出去就停手了**（本批没跑完的任务已置回 queued）：
+        要么预算用尽（调用方停止再送低优先级任务），要么估价系统坏掉
+        （self.estimate_broken 置位，调用方连高优先级都不许再送，工单 8b）。
         """
         if not batch:
             return False
+        if self.estimate_broken:  # 闸门已落：一条都不许再送
+            self._set_status([j.id for j in batch], "queued")
+            stats.skipped_estimate += len(batch)
+            stats.estimate_broken = True
+            return True
         stats.batches += 1
         self._set_status([j.id for j in batch], "running")
 
@@ -426,7 +469,9 @@ class AnnotateWorker:
             # 预算检查/记账必须在**每次**真实调用之前，重试也不例外（工单 6-1）
             if not self._afford(pending, stats):
                 budget_stop = True
-                last_err = "预算用尽，未送出"
+                last_err = (
+                    "估价不可用，未送出" if self.estimate_broken else "预算用尽，未送出"
+                )
                 break
             if attempt:
                 self.log(
@@ -466,8 +511,12 @@ class AnnotateWorker:
         if budget_stop and pending:
             skipped = list(pending)
             self._set_status([j.id for j in skipped], "queued")
-            stats.skipped_budget += len(skipped)
-            self.log(f"预算截断：{[j.lemma for j in skipped]} 放回队列")
+            if self.estimate_broken:
+                stats.skipped_estimate += len(skipped)
+                self.log(f"估价不可用：{[j.lemma for j in skipped]} 放回队列")
+            else:
+                stats.skipped_budget += len(skipped)
+                self.log(f"预算截断：{[j.lemma for j in skipped]} 放回队列")
 
         ok_ids: list[int] = []
         for job in batch:
@@ -510,11 +559,31 @@ class AnnotateWorker:
         return ready
 
     def _estimate(self, batch: list[Job]) -> float:
+        """估价，**fail closed**（工单 8b）。
+
+        estimate_cost 抛异常 / 返回 None / NaN / inf / 负数 → 抛 EstimateUnavailable。
+        以前这里 return 0.0，等于“估价系统坏了就当免费”，能让一整轮任务按 ¥0 跑
+        进真 API。现在不确定成本时一分钱都不花。
+        """
         try:
-            return float(self.provider.estimate_cost([dict(j.pack) for j in batch]))
+            raw = self.provider.estimate_cost([dict(j.pack) for j in batch])
         except Exception as exc:
-            self.log(f"估价失败（按 0 处理）：{type(exc).__name__}: {exc}")
-            return 0.0
+            raise EstimateUnavailable(
+                f"estimate_cost 抛异常 {type(exc).__name__}: {exc}"
+            ) from exc
+        if raw is None or isinstance(raw, bool):
+            raise EstimateUnavailable(f"estimate_cost 返回 {raw!r}（不是数）")
+        try:
+            val = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise EstimateUnavailable(
+                f"estimate_cost 返回 {raw!r}，转不成数字: {exc}"
+            ) from exc
+        if math.isnan(val) or math.isinf(val):
+            raise EstimateUnavailable(f"estimate_cost 返回 {val}（NaN/inf）")
+        if val < 0:
+            raise EstimateUnavailable(f"estimate_cost 返回负数 {val}")
+        return val
 
     def run_once(self) -> RunStats:
         """处理当前队列里能处理的全部任务，返回统计。不抛异常。"""
@@ -531,9 +600,22 @@ class AnnotateWorker:
         high = self._prepare([j for j in jobs if j.high], stats)
         low = self._prepare([j for j in jobs if not j.high], stats)
 
-        # 高优先级（用户点击收藏的词）不受预算限制，永远先跑（花费仍然记账）
+        # 高优先级（用户点击收藏的词）不受预算限制，永远先跑（花费仍然记账）。
+        # 唯一能拦住它们的是估价系统坏掉（工单 8b）——那时连收藏也不许花钱。
         for i in range(0, len(high), self.batch_size):
-            self.process_batch(high[i : i + self.batch_size], stats)
+            batch = high[i : i + self.batch_size]
+            self.process_batch(batch, stats)
+            if self.estimate_broken:
+                rest = high[i + len(batch) :] + low
+                if rest:
+                    stats.skipped_estimate += len(rest)
+                    self._set_status([j.id for j in rest], "queued")
+                self.log(
+                    f"估价不可用：本轮停手，还有 {len(rest)} 个任务（含高优先级）"
+                    f"保持 queued"
+                )
+                stats.est_cost = self.est_cost
+                return stats
 
         # 低优先级（预热）按预算截断。截断判定在 process_batch 里逐次调用做，
         # 这里只负责收摊：剩下的批次一个都不送，全部保持 queued。
@@ -542,8 +624,16 @@ class AnnotateWorker:
             if self.process_batch(batch, stats):
                 rest = low[i + len(batch) :]
                 if rest:
-                    stats.skipped_budget += len(rest)
-                    self.log(f"预算截断：还有 {len(rest)} 个低优先级任务保持 queued")
+                    if self.estimate_broken:
+                        stats.skipped_estimate += len(rest)
+                        self.log(
+                            f"估价不可用：还有 {len(rest)} 个任务保持 queued"
+                        )
+                    else:
+                        stats.skipped_budget += len(rest)
+                        self.log(
+                            f"预算截断：还有 {len(rest)} 个低优先级任务保持 queued"
+                        )
                 break
 
         stats.est_cost = self.est_cost
@@ -561,10 +651,16 @@ class AnnotateWorker:
                 total.done += s.done
                 total.failed += s.failed
                 total.skipped_budget += s.skipped_budget
+                total.skipped_estimate += s.skipped_estimate
                 total.batches += s.batches
                 total.calls += s.calls
                 total.rows += s.rows
                 total.est_cost = self.est_cost
+                if s.estimate_broken:
+                    # 估价坏了不是“等一等就好”的事，接着轮询只会刷屏。退出让人来修。
+                    total.estimate_broken = True
+                    self.log("估价不可用：退出 --loop（任务全部保持 queued）")
+                    break
                 if s.done == 0 and s.failed == 0:
                     self._sleep(poll)
         except KeyboardInterrupt:
@@ -576,10 +672,24 @@ class AnnotateWorker:
     def dry_run(self) -> dict:
         """只组包 + 估价，不调 provider、不写库、不改任务状态。"""
         jobs = self._prepare_dry(self.queued_jobs(self.limit))
-        est = self._estimate(jobs) if jobs else 0.0
+        error = ""
+        try:
+            est = self._estimate(jobs) if jobs else 0.0
+        except EstimateUnavailable as exc:  # 估价坏了就如实说，别报一个假的 0
+            error = str(exc)
+            self.log(f"dry-run 估价不可用：{exc}")
+            return {
+                "jobs": len(jobs),
+                "estimate_cny": None,
+                "estimate_error": error,
+                "budget": self.budget,
+                "over_budget": True,  # 不知道多贵 = 当作贵到超预算
+                "packs": [j.pack for j in jobs],
+            }
         return {
             "jobs": len(jobs),
             "estimate_cny": round(est, 4),
+            "estimate_error": "",
             "budget": self.budget,
             "over_budget": est > self.budget,
             "packs": [j.pack for j in jobs],
@@ -666,13 +776,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.dry_run:
             info = worker.dry_run()
-            print(
-                f"[annotate] dry-run: {info['jobs']} 个任务，预估 ¥{info['estimate_cny']}"
-                f"（预算 ¥{info['budget']:.2f}）"
-            )
+            if info.get("estimate_error"):
+                print(
+                    f"[annotate] dry-run: {info['jobs']} 个任务，"
+                    f"**估价不可用**：{info['estimate_error']}"
+                )
+            else:
+                print(
+                    f"[annotate] dry-run: {info['jobs']} 个任务，"
+                    f"预估 ¥{info['estimate_cny']}（预算 ¥{info['budget']:.2f}）"
+                )
             for pack in info["packs"][:10]:
                 print("  " + json.dumps(pack, ensure_ascii=False))
-            return 0
+            return EXIT_ESTIMATE_BROKEN if info.get("estimate_error") else 0
 
         worker.reset_stale_running()
         stats = worker.run_loop(poll=args.poll) if args.loop else worker.run_once()
@@ -680,10 +796,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     d = stats.as_dict()
     print(
         f"[annotate] done={d['done']} failed={d['failed']} "
-        f"skipped_budget={d['skipped_budget']} rows={d['rows']} "
+        f"skipped_budget={d['skipped_budget']} "
+        f"skipped_estimate={d['skipped_estimate']} rows={d['rows']} "
         f"calls={d['calls']} est_cost=¥{d['est_cost']}（预算 ¥{args.budget:.2f}，"
         f"含重试的每次调用都计费）"
     )
+    if d["estimate_broken"]:
+        print(
+            "[annotate] 估价不可用：本轮已停手，任务全部保持 queued，"
+            "一分钱没花。修好 provider.estimate_cost 再重跑。"
+        )
+        return EXIT_ESTIMATE_BROKEN
     return 0
 
 
