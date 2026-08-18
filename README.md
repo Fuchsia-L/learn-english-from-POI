@@ -65,6 +65,8 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 - **生词本界面**：卡片栅格（`auto-fill minmax(330px,1fr)`），每张卡展开
   词元/音标/词性/词典释义 + **AI 助记** + 全部 encounter（集数、时间、原形、原句），
   每条 encounter 有「去这句」按钮直接跳回播放界面定位到那一秒。
+  数据只在**打开这个界面时拉一次**（`/vocab` 一次 + 每张卡的 `/mnemonic` 各一次），
+  **不轮询**；worker 后来生成的助记要点右上角的「刷新」才会出现。
 
 ### 字幕三档与遮罩
 
@@ -115,8 +117,9 @@ pytest tests/test_player_e2e.py
 ## annotate：助记 worker
 
 助记是**异步旁路**：收藏时只往 `AnnotationJob` 排个队，播放器该放放该点点；
-worker 单独跑，生成完写进 `Mnemonic`，前端轮询 `GET /mnemonic?lexeme_id=` 拿结果。
-LLM 永不阻塞播放（DESIGN §0）。
+worker 单独跑，生成完写进 `Mnemonic`，前端再从 `GET /mnemonic?lexeme_id=` 拿结果。
+**两个界面取法不同**：查询卡开着时按 2s 轮询（最多 30s）；生词本界面只在打开时
+对每张卡各拉一次，**不轮询**，想看新结果点「刷新」。LLM 永不阻塞播放（DESIGN §0）。
 
 ```bash
 # 离线跑一轮：fake provider，确定性假内容，0 元、0 网络请求
@@ -150,6 +153,10 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
 - **预算制**（DESIGN §5）：累计 `estimate_cost` 超 `--budget`（默认 ¥4）后，
   低优先级任务一律不再送出、保持 `queued`（调高预算再跑就继续）；
   高优先级（收藏的词）不受预算限制。
+- **估价 fail closed**（工单 8b）：`estimate_cost` 抛异常 / 返回 `None` / `NaN` /
+  `inf` / 负数时，**本轮立刻停手**——一次调用都不发，任务保持 `queued`，日志写明
+  原因，进程退出码 `3`（`skipped_estimate` 计数）。**高优先级也停**：估价系统坏了
+  就是坏了，不确定成本时一分钱都不许花。绝不再按 ¥0 继续跑。
 - 免责标签由**代码**兜底，不指望模型自觉：`morph` 拆分永远标"未经词源核验"，
   其余 hook 一律带"非词源"。没有事实区（DESIGN §5：`factual` 已处决）。
 - 单任务失败、provider 抛任何异常、落库出错都不会掀翻 worker。
@@ -161,8 +168,16 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
 这条写死在模板里。`python -m app.annotate --dry-run` 会打印真实输入包，
 `provider.dump_prompt(batch)` 打印完整 system + user prompt。
 
-价目表（人民币/百万 token）写在各 provider 类顶部的
-`price_in_cny_per_mtok` / `price_out_cny_per_mtok`，**随时可能过期，自己核对官网后改**。
+价目表写在各 provider 模块顶部的常量里（`app/providers/deepseek.py` 是
+`USD_PER_MTOK_*` 一组美元牌价 + 汇率常量 `USD_CNY`，换算出类上的
+`price_in_cny_per_mtok` / `price_out_cny_per_mtok`），**随时可能过期，自己核对官网后改**。
+
+DeepSeek 默认模型是 **`deepseek-v4-flash`**（旧的 `deepseek-chat` / `deepseek-reasoner`
+已被官方宣布退役）。该系列**默认开 thinking 且 effort=high**，助记生成用不上，
+请求体里已显式写死 `"thinking": {"type": "disabled"}`，不然要重度多计费。
+换模型用 `--model`（只对真 provider 有意义，`fake` 忽略）。
+估价一律按**峰时 + cache-miss**（牌价最贵那档）算 —— 预算是硬顶，不许乐观估。
+按默认 `--batch-size 4` 算下来约 **¥0.004/词**，¥4 预算够跑 ~970 个词。
 
 ## prefetch：预热入队
 
