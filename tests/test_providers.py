@@ -31,7 +31,13 @@ from app.providers import (  # noqa: E402
     validate_annotation,
 )
 from app.providers import _manual_validate  # noqa: E402
-from app.providers.base import approx_tokens, parse_json_array  # noqa: E402
+from app.providers.base import (  # noqa: E402
+    ChatJSONProvider,
+    Price,
+    PriceConfigError,
+    approx_tokens,
+    parse_json_array,
+)
 from app.providers.deepseek import DEFAULT_MODEL as DS_DEFAULT_MODEL  # noqa: E402
 from app.providers.fake import FakeInjectedFailure, FakeProvider  # noqa: E402
 from app.providers.prompts import build_user_prompt, debug_dump  # noqa: E402
@@ -67,6 +73,14 @@ def no_keys(monkeypatch):
     """确保测试环境里没有真 key（否则骨架用例会想去发请求）。"""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_price_override(monkeypatch):
+    """牌价环境变量清干净：本机若设过覆盖值，估价类用例会莫名其妙地飘。"""
+    for prefix in ("POI_DEEPSEEK_PRICE", "POI_ANTHROPIC_PRICE"):
+        for suffix in ("_IN", "_OUT"):
+            monkeypatch.delenv(prefix + suffix, raising=False)
 
 
 # --- 注册表 ----------------------------------------------------------------
@@ -515,6 +529,157 @@ def test_deepseek_estimate_is_sane_per_word():
     batch = [{**ITEM, "id": str(i)} for i in range(4)]
     per_word = get_provider("deepseek").estimate_cost(batch) / 4
     assert 0.002 < per_word < 0.008
+
+
+# --- 工单 16-2：牌价 = 带元数据的结构 + 可覆盖 + 非法即 fail closed ---------
+
+
+@pytest.mark.parametrize("name", ["deepseek", "anthropic"])
+def test_price_is_a_structure_with_metadata(name):
+    """两家 provider 的牌价**同一个形状**：单价 + 币种 + 来源 + as_of + 备注。"""
+    p = get_provider(name)
+    price = p.base_price()
+    assert isinstance(price, Price)
+    assert price.input_per_mtok > 0 and price.output_per_mtok > 0
+    assert price.currency == "CNY" and price.symbol == "¥"
+    assert price.source and price.as_of and price.note
+    assert "以官方现价为准" in price.note
+    # 结构能整体导出（对账/日志用），键名两家一致
+    assert set(price.as_dict()) == {
+        "input_per_mtok", "output_per_mtok", "currency", "source", "as_of", "note",
+    }
+
+
+def test_price_values_unchanged_by_the_refactor():
+    """结构化只是换了个装法，数值一分没动。"""
+    import app.providers.anthropic_api as AN
+    import app.providers.deepseek as DS
+
+    assert (DS.PRICE.input_per_mtok, DS.PRICE.output_per_mtok) == (3.0, 9.0)
+    assert DS.PRICE.as_of == "2026-08-16"
+    assert (AN.PRICE.input_per_mtok, AN.PRICE.output_per_mtok) == (7.2, 36.0)
+    # Anthropic 那两个数是美元牌价折算的粗估、没核过现价：as_of 就得说实话
+    assert "unverified" in AN.PRICE.as_of and "非" in AN.PRICE.source
+    # 老名字仍然可用（README / 外部代码引用的是它们）
+    assert get_provider("deepseek").price_in_cny_per_mtok == 3.0
+    assert get_provider("anthropic").price_out_cny_per_mtok == 36.0
+
+
+def test_estimate_cost_carries_as_of_but_is_still_a_float():
+    """估价结果自带 as_of 标注，同时对老调用方完全是个 float。"""
+    est = get_provider("deepseek").estimate_cost(BATCH)
+    assert isinstance(est, float) and est > 0
+    assert est.as_of == "2026-08-16"
+    assert est.price.currency == "CNY"
+    assert "as_of=2026-08-16" in est.label()
+    assert "as_of=2026-08-16" in repr(est)
+    # 预算比较 / 取整 / 格式化 一律照旧
+    assert round(est, 4) == round(float(est), 4)
+    assert (est > 999.0) is False and f"{est:.4f}".count(".") == 1
+    assert get_provider("deepseek").estimate_cost([]) == 0.0
+
+
+def test_price_label_shows_source_and_as_of():
+    label = get_provider("deepseek").price_label()
+    assert "¥3" in label and "¥9" in label
+    assert "as_of=2026-08-16" in label and "official price page" in label
+    assert get_provider("deepseek").resolved_price().stamp() == "牌价 as_of=2026-08-16"
+
+
+def test_price_env_override_changes_the_estimate(monkeypatch):
+    """牌价变了不必改代码：POI_DEEPSEEK_PRICE_IN/OUT 直接覆盖（元 / 百万 token）。"""
+    base = get_provider("deepseek").estimate_cost(BATCH)
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "30")
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "90")
+    p = get_provider("deepseek")
+    assert p.price_in_cny_per_mtok == 30.0 and p.price_out_cny_per_mtok == 90.0
+    est = p.estimate_cost(BATCH)
+    assert est == pytest.approx(float(base) * 10, rel=1e-3)
+    # 覆盖后 as_of / source 要说清"这不是表里那份"
+    assert "env-override" in est.as_of and "2026-08-16" in est.as_of
+    assert "POI_DEEPSEEK_PRICE_IN+POI_DEEPSEEK_PRICE_OUT" in est.price.source
+
+
+def test_price_env_override_can_be_partial(monkeypatch):
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "1.5")
+    price = get_provider("deepseek").resolved_price()
+    assert price.input_per_mtok == 3.0 and price.output_per_mtok == 1.5
+    assert "POI_DEEPSEEK_PRICE_OUT" in price.source
+    assert "POI_DEEPSEEK_PRICE_IN+" not in price.source
+
+
+def test_price_env_override_zero_is_allowed(monkeypatch):
+    """0 是合法价（免费档），不当异常处理——只有负数/NaN/非数才算坏。"""
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "0")
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "0")
+    assert get_provider("deepseek").estimate_cost(BATCH) == 0.0
+
+
+@pytest.mark.parametrize(
+    "bad", ["-1", "-0.001", "nan", "NaN", "inf", "-inf", "abc", "3.0元", "", "  "]
+)
+def test_illegal_price_override_fails_closed(monkeypatch, bad):
+    """非法覆盖值 = 估价失败，绝不"当没看见"按原价照跑。"""
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", bad)
+    p = get_provider("deepseek")
+    with pytest.raises(PriceConfigError) as e:
+        p.estimate_cost(BATCH)
+    assert "POI_DEEPSEEK_PRICE_IN" in str(e.value)
+    with pytest.raises(PriceConfigError):  # 老属性同样拦，不给任何后门
+        p.price_in_cny_per_mtok
+
+
+def test_illegal_price_override_on_output_side(monkeypatch):
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "-5")
+    with pytest.raises(PriceConfigError, match="POI_DEEPSEEK_PRICE_OUT"):
+        get_provider("deepseek").estimate_cost(BATCH)
+
+
+def test_each_provider_reads_its_own_env_prefix(monkeypatch):
+    """别串味：设 DeepSeek 的覆盖不许影响 Anthropic，反之亦然。"""
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "99")
+    assert get_provider("anthropic").price_in_cny_per_mtok == 7.2
+    monkeypatch.delenv("POI_DEEPSEEK_PRICE_IN")
+    monkeypatch.setenv("POI_ANTHROPIC_PRICE_IN", "99")
+    assert get_provider("anthropic").price_in_cny_per_mtok == 99.0
+    assert get_provider("deepseek").price_in_cny_per_mtok == 3.0
+
+
+def test_provider_without_price_fails_closed():
+    """自定义 provider 忘了填牌价：估价直接抛，不许按 ¥0 蒙混过关。"""
+
+    class Unpriced(ChatJSONProvider):
+        name = "unpriced"
+
+    with pytest.raises(PriceConfigError, match="没有牌价"):
+        Unpriced().estimate_cost(BATCH)
+
+
+def test_legacy_float_price_attributes_still_work():
+    """老式写法（两个 float 类属性）仍然能估价，只是 as_of 标"未标注"。"""
+
+    class Legacy(ChatJSONProvider):
+        name = "legacy"
+        price_in_cny_per_mtok = 3.0
+        price_out_cny_per_mtok = 9.0
+
+    class Structured(ChatJSONProvider):
+        name = "structured"
+        price = Price(3.0, 9.0, as_of="2026-08-16")
+
+    est = Legacy().estimate_cost(BATCH)
+    assert est == pytest.approx(float(Structured().estimate_cost(BATCH)))
+    assert est.price.input_per_mtok == 3.0 and est.as_of == "未标注"
+
+
+def test_legacy_float_price_attributes_are_validated():
+    class BadLegacy(ChatJSONProvider):
+        name = "bad-legacy"
+        price_in_cny_per_mtok = -1.0
+        price_out_cny_per_mtok = 9.0
+
+    with pytest.raises(PriceConfigError, match="负数"):
+        BadLegacy().estimate_cost(BATCH)
 
 
 def _resp(text: str, name: str) -> dict:
