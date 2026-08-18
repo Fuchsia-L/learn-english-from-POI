@@ -503,7 +503,7 @@ def test_budget_stops_mid_batch_retry_and_requeues(env: dict, logs: list):
     assert job_status(env["db"], job)["status"] == "queued"
 
 
-# --- 重试 / 失败 ------------------------------------------------------------
+# --- 重试 / 失败 -----------------------------------------------------------
 
 
 def test_retry_then_success(env: dict, logs: list):
@@ -890,6 +890,113 @@ def test_cli_dry_run_sample_skipped_for_provider_without_payload(env: dict, caps
     rc = A.main(["--db", str(env["db"]), "--ecdict", str(env["ecdict"]), "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0 and "请求体样例" not in out
+
+
+# --- 工单 16-2：牌价 as_of 肉眼可见 + 覆盖值非法即 fail closed --------------
+
+
+@pytest.fixture(autouse=True)
+def _no_price_override(monkeypatch):
+    """本机若设过牌价覆盖，估价类用例会莫名其妙地飘——先清干净。"""
+    for name in (
+        "POI_DEEPSEEK_PRICE_IN", "POI_DEEPSEEK_PRICE_OUT",
+        "POI_ANTHROPIC_PRICE_IN", "POI_ANTHROPIC_PRICE_OUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_dry_run_carries_price_as_of(env: dict, monkeypatch):
+    """dry_run() 的返回里带牌价说明（含 as_of），别让估价数字裸奔。"""
+    from app.providers import get_provider
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    enqueue(env["db"], "gardener")
+    with make_worker(env, provider=get_provider("deepseek")) as w:
+        info = w.dry_run()
+    assert info["jobs"] == 1 and info["estimate_cny"] > 0
+    assert "as_of=2026-08-16" in info["price"]
+    assert info["price_as_of"] == "牌价 as_of=2026-08-16"
+
+
+def test_dry_run_price_empty_for_provider_without_prices(env: dict):
+    """fake 没有牌价概念：不打印、也不报错。"""
+    enqueue(env["db"], "gardener")
+    with make_worker(env, provider=FakeProvider(cost_per_item=0.5)) as w:
+        info = w.dry_run()
+    assert info["price"] == "" and info["price_as_of"] == ""
+
+
+def test_cli_prints_price_as_of(env: dict, capsys, monkeypatch):
+    """--dry-run 里"这是某天的牌价"肉眼可见（零网络：deepseek 无 key 也不发包）。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    enqueue(env["db"], "gardener")
+    rc = A.main([
+        "--db", str(env["db"]), "--ecdict", str(env["ecdict"]),
+        "--provider", "deepseek", "--dry-run",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "牌价 as_of=2026-08-16" in out          # 启动行的短标注
+    assert "牌价(估算依据):" in out and "official price page" in out
+    assert "以官方现价为准" in out
+
+
+def test_cli_run_summary_omits_price_for_fake(env: dict, capsys):
+    """fake 没牌价：收尾行不带 as_of，不刷无意义的字。"""
+    enqueue(env["db"], "gardener")
+    rc = A.main(["--db", str(env["db"]), "--ecdict", str(env["ecdict"]), "--once"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "est_cost=" in out and "牌价 as_of" not in out
+
+
+def test_illegal_price_env_override_stops_the_run(env: dict, capsys, monkeypatch):
+    """POI_DEEPSEEK_PRICE_IN=-1 → 估价失败 → 本轮停手、一次调用不发、退出码 3。
+
+    真 provider（deepseek）在这条路径上根本走不到 HTTP：估价先炸。
+    """
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "-1")
+    job = enqueue(env["db"], "gardener", priority=0)
+    rc = A.main([
+        "--db", str(env["db"]), "--ecdict", str(env["ecdict"]),
+        "--provider", "deepseek", "--once",
+    ])
+    out = capsys.readouterr().out
+    assert rc == A.EXIT_ESTIMATE_BROKEN == 3
+    assert "估价不可用" in out and "skipped_estimate=1" in out
+    assert "POI_DEEPSEEK_PRICE_IN" in out  # 说清楚是哪个环境变量配坏了
+    assert job_status(env["db"], job)["status"] == "queued"  # 任务原地留着
+
+
+@pytest.mark.parametrize("bad", ["abc", "nan", "-0.5"])
+def test_illegal_price_env_override_blocks_high_priority_too(
+    env: dict, monkeypatch, bad
+):
+    """收藏（高优先级）同样停：不确定成本时一分钱都不许花。"""
+    from app.providers import get_provider
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", bad)
+    enqueue(env["db"], "gardener", priority=A.HIGH_PRIORITY)
+    with make_worker(env, provider=get_provider("deepseek")) as w:
+        stats = w.run_once()
+    assert stats.estimate_broken and stats.skipped_estimate == 1
+    assert stats.calls == 0 and stats.est_cost == 0.0
+
+
+def test_valid_price_env_override_is_honoured_end_to_end(env: dict, monkeypatch):
+    """合法覆盖值真的进了预算账：把牌价抬高 100 倍，预算立刻被吃满。"""
+    from app.providers import get_provider
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "300")
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "900")
+    job = enqueue(env["db"], "gardener", priority=0)
+    with make_worker(env, provider=get_provider("deepseek"), budget=0.05) as w:
+        stats = w.run_once()
+    assert stats.calls == 0 and stats.skipped_budget == 1  # 预算截断，不是估价坏
+    assert not stats.estimate_broken
+    assert job_status(env["db"], job)["status"] == "queued"
 
 
 def test_cli_unknown_provider_returns_nonzero(env: dict, capsys):
