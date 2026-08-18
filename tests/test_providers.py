@@ -490,23 +490,24 @@ def test_deepseek_price_table_is_peak_cache_miss():
     """估价口径：峰时 + cache-miss（牌价最贵那档）——预算是硬顶，不许乐观估。"""
     import app.providers.deepseek as DS
 
-    assert DS.USD_PER_MTOK_IN_MISS_PEAK == 0.44
-    assert DS.USD_PER_MTOK_IN_MISS_OFF == 0.22
-    assert DS.USD_PER_MTOK_IN_HIT_PEAK == 0.014
-    assert DS.USD_PER_MTOK_IN_HIT_OFF == 0.007
-    assert DS.USD_PER_MTOK_OUT_PEAK == 1.32
-    assert DS.USD_PER_MTOK_OUT_OFF == 0.66
+    # 官方人民币牌价 2026-08（元 / 百万 token）
+    assert DS.PRICE_IN_MISS_PEAK_CNY_PER_MTOK == 3.0
+    assert DS.PRICE_OUT_PEAK_CNY_PER_MTOK == 9.0
+    # 错峰 = 峰价减半；缓存命中 ¥0.10（错峰再减半）
+    assert DS.PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK == 1.5
+    assert DS.PRICE_OUT_OFFPEAK_CNY_PER_MTOK == 4.5
+    assert DS.PRICE_IN_HIT_PEAK_CNY_PER_MTOK == 0.10
+    assert DS.PRICE_IN_HIT_OFFPEAK_CNY_PER_MTOK == 0.05
+    # 峰时窗口：北京时间 9–12 点与 14–18 点
+    assert DS.PEAK_HOURS_BEIJING == ((9, 12), (14, 18))
     p = get_provider("deepseek")
-    # 类上的人民币价 = 峰时美元价 × 可配置汇率常量
-    assert p.price_in_cny_per_mtok == pytest.approx(
-        DS.USD_PER_MTOK_IN_MISS_PEAK * DS.USD_CNY
-    )
-    assert p.price_out_cny_per_mtok == pytest.approx(
-        DS.USD_PER_MTOK_OUT_PEAK * DS.USD_CNY
-    )
-    # 谷时/命中缓存都比估价便宜：估价确实是上界
-    assert DS.USD_PER_MTOK_IN_MISS_OFF < DS.USD_PER_MTOK_IN_MISS_PEAK
-    assert DS.USD_PER_MTOK_OUT_OFF < DS.USD_PER_MTOK_OUT_PEAK
+    # 类上用的就是峰时 cache-miss 那两个数，不掺汇率、不打折
+    assert p.price_in_cny_per_mtok == DS.PRICE_IN_MISS_PEAK_CNY_PER_MTOK
+    assert p.price_out_cny_per_mtok == DS.PRICE_OUT_PEAK_CNY_PER_MTOK
+    # 错峰/命中缓存都比估价便宜：估价确实是上界
+    assert DS.PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK < p.price_in_cny_per_mtok
+    assert DS.PRICE_IN_HIT_PEAK_CNY_PER_MTOK < p.price_in_cny_per_mtok
+    assert DS.PRICE_OUT_OFFPEAK_CNY_PER_MTOK < p.price_out_cny_per_mtok
 
 
 def test_deepseek_estimate_is_sane_per_word():
