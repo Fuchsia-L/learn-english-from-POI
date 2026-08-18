@@ -634,7 +634,7 @@ function paintMask(force){
 
   var M = CONF.MASK;
   // 取样区 = 遮罩带 + 带上方 PAD 行（那里没有字，当背景参考；画布靠 CSS 负偏移
-  // 顶出可见区，被 .mask 的 overflow:hidden 裁掉，所以不会盖住画面）
+  // 顶出可视区，被 .mask 的 overflow:hidden 裁掉，所以不会盖住画面）
   var sy = clamp(sample[0] / CONF.REF_H * vh, 0, vh - 1);
   var sh = clamp((sample[1] - sample[0]) / CONF.REF_H * vh, 1, vh - sy);
   var w = clamp(Math.round(vw / M.DOWN_X), M.MIN_W, M.MAX_W);
