@@ -9,6 +9,9 @@ fastapi==0.141.1
 uvicorn==0.46.0
 starlette==1.0.0
 pydantic==2.13.3
+# 剧集导入的 multipart 上传（POST /import，工单 12）：fastapi 的 Form/File 靠它解包。
+# 媒体处理还要系统装 ffmpeg（含 ffprobe），那个不在 pip 里。
+python-multipart==0.0.26
 
 # 硬字幕 OCR（scripts/extract_hardsub.py，另需系统装 ffmpeg + tesseract-ocr[eng]）
 pillow==12.2.0

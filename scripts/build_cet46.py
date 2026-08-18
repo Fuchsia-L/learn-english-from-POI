@@ -5,6 +5,11 @@
 `CET6_edited.txt`（大学英语四/六级大纲词表）。走 `git clone --depth 1`
 （raw.githubusercontent.com 在本机可能被代理拦，不依赖它），用完删除克隆目录。
 
+**克隆目录的安全边界（工单 16-1）**：`--work-dir` 给的是"在哪儿放克隆目录"，
+脚本在它内部用 `tempfile.mkdtemp` 开一个唯一子目录，事后只 rmtree 这个子目录；
+用户给的目录本身和里面原有的东西一概不动（老版本会 `rmtree(work_dir)`，
+`--work-dir ~/Documents` 就是一场事故）。不给 `--work-dir` 时在系统临时目录里开。
+
 用法::
 
     python scripts/build_cet46.py                       # 克隆 → 合并 → 清理
@@ -42,6 +47,8 @@ from app.consts import DEFAULT_WORDLIST  # noqa: E402
 from app.ingest import lemmatize, normalize_surface  # noqa: E402
 
 WORDLIST_REPO = "https://github.com/mahavivo/english-wordlists.git"
+# 克隆用的一次性子目录前缀（脚本只删自己用这个前缀 mkdtemp 出来的目录）
+CLONE_PREFIX = "cet46_src_"
 # 仓库里的四级 / 六级大纲词表（顺序即统计里的「增量」口径：先四级，六级只算新增）
 SOURCE_NAMES = ("CET4_edited.txt", "CET6_edited.txt")
 
@@ -127,11 +134,36 @@ def write_wordlist(path: str | Path, words: Sequence[str], source: str) -> int:
 # --- 取词表 ----------------------------------------------------------------
 
 
+def make_clone_dir(work_dir: str | Path | None) -> Path:
+    """给这次克隆开一个**本脚本自己创建的**空目录，返回它。
+
+    安全边界（工单 16-1）：用户用 --work-dir 给的目录**永远不被删除、不被清空**，
+    脚本只在它**内部**用 `tempfile.mkdtemp` 开一个唯一子目录，克隆和事后清理都
+    只碰这个子目录。不给 --work-dir 时就在系统临时目录里 mkdtemp（行为不变）。
+    以前的写法是 `rmtree(work_dir)` —— 用户随手传 `--work-dir ~/Documents`
+    就会把整个目录递归删掉。
+    """
+    if work_dir is None:
+        return Path(tempfile.mkdtemp(prefix=CLONE_PREFIX))
+    base = Path(work_dir).expanduser()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=CLONE_PREFIX, dir=base))
+    except OSError as exc:
+        raise RuntimeError(
+            f"--work-dir 不可用: {base}（{exc}）；给一个可写目录，或省略该参数"
+            f"（默认用系统临时目录）"
+        ) from exc
+
+
 def clone_wordlists(work_dir: Path) -> list[Path]:
-    """git clone --depth 1，返回 CET4/CET6 词表路径。失败抛 RuntimeError。"""
-    if work_dir.exists():
-        shutil.rmtree(work_dir)
-    work_dir.parent.mkdir(parents=True, exist_ok=True)
+    """git clone --depth 1 到 work_dir（必须是本脚本开的空目录），返回词表路径。
+
+    本函数**不删除任何东西**：目录的生命周期由 make_clone_dir/build 管。
+    失败抛 RuntimeError。
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)  # mkdtemp 已建好，这里只是兜底
     print(f"[clone] {WORDLIST_REPO} -> {work_dir}（约 11MB，用完删除）")
     proc = subprocess.run(
         ["git", "clone", "--depth", "1", WORDLIST_REPO, str(work_dir)],
@@ -157,15 +189,34 @@ def clone_wordlists(work_dir: Path) -> list[Path]:
     return paths
 
 
+def _cleanup_clone(clone_root: Path | None, keep_clone: bool) -> None:
+    """只删脚本自己 mkdtemp 出来的那个子目录，绝不碰用户给的 --work-dir 本身。"""
+    if clone_root is None:
+        return
+    if keep_clone:
+        print(f"[keep] 保留克隆目录 {clone_root}（--keep-clone）")
+        return
+    if not clone_root.name.startswith(CLONE_PREFIX):  # 防呆：不是我开的就不删
+        print(f"[clean] 跳过删除（不是本脚本创建的目录）: {clone_root}")
+        return
+    if clone_root.exists():
+        shutil.rmtree(clone_root, ignore_errors=True)
+        print(f"[clean] 已删除克隆目录 {clone_root}")
+
+
 def build(
     out_path: Path,
     sources: Sequence[Path] | None,
-    work_dir: Path,
+    work_dir: Path | None = None,
     keep_clone: bool = False,
     dry_run: bool = False,
 ) -> dict:
-    """取词表 → 合并去重 + lemma 归一 → 写文件，返回统计。"""
-    cloned = False
+    """取词表 → 合并去重 + lemma 归一 → 写文件，返回统计。
+
+    work_dir 是**放克隆目录的地方**，不是克隆目录本身：真正被 rmtree 的永远是
+    脚本自己在它里面 mkdtemp 出来的一次性子目录（工单 16-1）。None = 系统临时目录。
+    """
+    clone_root: Path | None = None
     if sources:
         missing = [str(p) for p in sources if not Path(p).is_file()]
         if missing:
@@ -173,16 +224,18 @@ def build(
         paths = [Path(p) for p in sources]
         origin = "本地文件: " + ", ".join(p.name for p in paths)
     else:
-        paths = clone_wordlists(work_dir)
-        cloned = True
+        clone_root = make_clone_dir(work_dir)
         origin = WORDLIST_REPO
+        try:
+            paths = clone_wordlists(clone_root)
+        except BaseException:  # 克隆失败也要收走自己开的那个临时子目录
+            _cleanup_clone(clone_root, keep_clone)
+            raise
     try:
         loaded = [(p.name, read_source(p)) for p in paths]
         merged = merge_sources(loaded)
     finally:
-        if cloned and not keep_clone and work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
-            print(f"[clean] 已删除克隆目录 {work_dir}")
+        _cleanup_clone(clone_root, keep_clone)
 
     written = 0
     if not dry_run:
@@ -225,8 +278,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     ap.add_argument(
         "--work-dir",
-        default=str(Path(tempfile.gettempdir()) / "cet46_src"),
-        help="git clone 的临时目录（默认用完即删）",
+        default=None,
+        help="放克隆目录的父目录（默认系统临时目录）。脚本在它**内部**新建一个唯一"
+        "子目录来克隆，用完只删这个子目录——你给的目录本身及其原有内容一律不动",
     )
     ap.add_argument("--keep-clone", action="store_true", help="构建后保留克隆目录")
     ap.add_argument("--dry-run", action="store_true", help="只统计，不写文件")
@@ -236,7 +290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stats = build(
             out_path=Path(args.out),
             sources=[Path(s) for s in args.source] if args.source else None,
-            work_dir=Path(args.work_dir),
+            work_dir=Path(args.work_dir) if args.work_dir else None,
             keep_clone=args.keep_clone,
             dry_run=args.dry_run,
         )

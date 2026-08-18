@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -143,6 +144,7 @@ def test_build_with_local_sources(tmp_path, sources):
     stats = B.build(out_path=out, sources=sources, work_dir=tmp_path / "clone")
     assert stats["total"] == stats["written"] == 9
     assert "本地文件" in stats["source"]
+    # 给了 --source 就根本不该克隆，work_dir 连建都不用建
     assert out.is_file() and not (tmp_path / "clone").exists()
 
 
@@ -208,32 +210,149 @@ def test_clone_missing_expected_files(tmp_path, monkeypatch):
         B.clone_wordlists(work)
 
 
-def test_build_cleans_clone_dir(tmp_path, monkeypatch, sources):
-    work = tmp_path / "clone"
+def fake_clone(sources, seen: list[Path] | None = None):
+    """假的 git clone：把 mini 词表写进**命令行给的那个目标目录**（cmd[-1]）。
 
-    def fake_run(cmd, capture_output=True, text=True):
-        work.mkdir(parents=True, exist_ok=True)
+    刻意不写死路径 —— 工单 16-1 之后克隆目标是脚本 mkdtemp 出来的一次性子目录，
+    写死就测不出"到底往哪儿克隆、又删了谁"。
+    """
+
+    def run(cmd, capture_output=True, text=True):
+        dest = Path(cmd[-1])
+        dest.mkdir(parents=True, exist_ok=True)
+        if seen is not None:
+            seen.append(dest)
         for name, src in zip(B.SOURCE_NAMES, sources):
-            (work / name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            (dest / name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(B.subprocess, "run", fake_run)
+    return run
+
+
+def test_build_cleans_clone_dir(tmp_path, monkeypatch, sources):
+    work = tmp_path / "clone"
+    seen: list[Path] = []
+
+    monkeypatch.setattr(B.subprocess, "run", fake_clone(sources, seen))
     out = tmp_path / "cet46.txt"
     stats = B.build(out_path=out, sources=None, work_dir=work)
     assert stats["total"] == 9 and stats["source"] == B.WORDLIST_REPO
-    assert not work.exists()  # 用完即删
+    # 克隆落在 work 内部的一次性子目录里，用完即删；work 本身活着
+    assert seen and seen[0].parent == work and not seen[0].exists()
+    assert work.is_dir()
     assert out.is_file()
 
 
 def test_build_keeps_clone_when_asked(tmp_path, monkeypatch, sources):
     work = tmp_path / "clone"
+    seen: list[Path] = []
 
-    def fake_run(cmd, capture_output=True, text=True):
-        work.mkdir(parents=True, exist_ok=True)
-        for name, src in zip(B.SOURCE_NAMES, sources):
-            (work / name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(B.subprocess, "run", fake_run)
+    monkeypatch.setattr(B.subprocess, "run", fake_clone(sources, seen))
     B.build(tmp_path / "cet46.txt", None, work, keep_clone=True)
-    assert (work / B.SOURCE_NAMES[0]).is_file()
+    assert (seen[0] / B.SOURCE_NAMES[0]).is_file()
+
+
+# --- 工单 16-1：--work-dir 绝不被递归删除 ----------------------------------
+
+
+def test_make_clone_dir_is_a_fresh_subdir_of_user_dir(tmp_path):
+    work = tmp_path / "mine"
+    work.mkdir()
+    (work / "keepme.txt").write_text("用户的东西", encoding="utf-8")
+
+    d1 = B.make_clone_dir(work)
+    d2 = B.make_clone_dir(work)
+    assert d1.parent == work and d2.parent == work and d1 != d2  # 每次一个新子目录
+    assert d1.is_dir() and not any(d1.iterdir())  # 空目录，git clone 吃得下
+    assert d1.name.startswith(B.CLONE_PREFIX)
+    assert (work / "keepme.txt").is_file()  # 用户原有内容纹丝不动
+
+
+def test_make_clone_dir_defaults_to_system_temp(tmp_path):
+    import tempfile as T
+
+    d = B.make_clone_dir(None)
+    try:
+        assert d.is_dir() and d.parent == Path(T.gettempdir())
+        assert d.name.startswith(B.CLONE_PREFIX)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_make_clone_dir_rejects_unusable_work_dir(tmp_path):
+    """--work-dir 指到一个普通文件上：报错，别把人家文件当目录乱搞。"""
+    f = tmp_path / "not_a_dir.txt"
+    f.write_text("x", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="--work-dir 不可用"):
+        B.make_clone_dir(f)
+
+
+def _seed_user_dir(work: Path) -> list[Path]:
+    """预置一个"用户自己的目录"：文件 + 子目录 + 子目录里的文件。"""
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "important.txt").write_text("别删我", encoding="utf-8")
+    sub = work / "sub"
+    sub.mkdir()
+    (sub / "nested.bin").write_bytes(b"\x00\x01")
+    return [work / "important.txt", sub, sub / "nested.bin"]
+
+
+def test_build_never_wipes_user_work_dir(tmp_path, monkeypatch, sources):
+    """核心红线：--work-dir 传既有目录，跑完原有内容完好无损。"""
+    work = tmp_path / "Documents"
+    kept = _seed_user_dir(work)
+    seen: list[Path] = []
+
+    monkeypatch.setattr(B.subprocess, "run", fake_clone(sources, seen))
+    out = tmp_path / "cet46.txt"
+    stats = B.build(out_path=out, sources=None, work_dir=work)
+
+    assert stats["total"] == 9 and out.is_file()
+    assert work.is_dir() and all(p.exists() for p in kept)
+    assert (work / "important.txt").read_text(encoding="utf-8") == "别删我"
+    assert (work / "sub" / "nested.bin").read_bytes() == b"\x00\x01"
+    # 只有脚本自己开的那个子目录被清掉，用户目录里再无残留
+    assert not seen[0].exists()
+    assert sorted(p.name for p in work.iterdir()) == ["important.txt", "sub"]
+
+
+def test_build_cleans_up_after_clone_failure_without_touching_user_dir(
+    tmp_path, monkeypatch
+):
+    """克隆失败也不许留垃圾、更不许删用户目录。"""
+    work = tmp_path / "Documents"
+    kept = _seed_user_dir(work)
+
+    def failing(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+        (Path(cmd[-1]) / ".git").mkdir()  # 半拉子克隆残骸
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: 网络不通")
+
+    monkeypatch.setattr(B.subprocess, "run", failing)
+    with pytest.raises(RuntimeError, match="git clone 失败"):
+        B.build(tmp_path / "cet46.txt", None, work)
+
+    assert all(p.exists() for p in kept)
+    assert sorted(p.name for p in work.iterdir()) == ["important.txt", "sub"]
+
+
+def test_main_with_work_dir_leaves_user_files_alone(tmp_path, monkeypatch, sources):
+    """走 CLI 一遍：--work-dir 是既有目录，退出码 0 且用户文件还在。"""
+    work = tmp_path / "Documents"
+    kept = _seed_user_dir(work)
+    monkeypatch.setattr(B.subprocess, "run", fake_clone(sources))
+    out = tmp_path / "cet46.txt"
+    rc = B.main(["-o", str(out), "--work-dir", str(work)])
+    assert rc == 0 and out.is_file()
+    assert all(p.exists() for p in kept)
+    assert sorted(p.name for p in work.iterdir()) == ["important.txt", "sub"]
+
+
+def test_cleanup_refuses_dirs_it_did_not_create(tmp_path, capsys):
+    """防呆：不是 mkdtemp 前缀的目录，_cleanup_clone 一律不删。"""
+    d = tmp_path / "someone_elses_dir"
+    d.mkdir()
+    (d / "x.txt").write_text("x", encoding="utf-8")
+    B._cleanup_clone(d, keep_clone=False)
+    assert d.is_dir() and (d / "x.txt").is_file()
+    assert "跳过删除" in capsys.readouterr().out
