@@ -796,6 +796,48 @@ def test_cli_dry_run_prints_estimate(env: dict, capsys):
     assert rc == 0 and "dry-run" in out and "gardener" in out
 
 
+def test_cli_dry_run_prints_deepseek_request_body(env: dict, capsys, monkeypatch):
+    """dry-run 打印真会发出去的请求体：模型名 + thinking 关（工单 8a）。
+
+    **零网络**：deepseek 没 key，payload() 也只是离线组装，不碰 _post()。
+    """
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    enqueue(env["db"], "gardener")
+    rc = A.main([
+        "--db", str(env["db"]), "--ecdict", str(env["ecdict"]),
+        "--provider", "deepseek", "--dry-run",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0 and "请求体样例" in out
+    body = json.loads(out.split("请求体样例(不发送): ")[1].splitlines()[0])
+    assert body["model"] == "deepseek-v4-flash"
+    assert body["thinking"] == {"type": "disabled"}
+    assert isinstance(body["messages"], str)      # prompt 正文折成摘要，不刷屏
+    assert "authorization" not in json.dumps(body).lower()  # 样例里没有鉴权信息
+
+
+def test_cli_model_flag_reaches_request_body(env: dict, capsys, monkeypatch):
+    """--model 一路透传到请求体（CLI → build_provider → payload）。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    enqueue(env["db"], "gardener")
+    A.main([
+        "--db", str(env["db"]), "--ecdict", str(env["ecdict"]),
+        "--provider", "deepseek", "--model", "deepseek-v4-flash-2512", "--dry-run",
+    ])
+    out = capsys.readouterr().out
+    body = json.loads(out.split("请求体样例(不发送): ")[1].splitlines()[0])
+    assert body["model"] == "deepseek-v4-flash-2512"
+    assert body["thinking"] == {"type": "disabled"}
+
+
+def test_cli_dry_run_sample_skipped_for_provider_without_payload(env: dict, capsys):
+    """fake 没有 payload()：不打印样例，也不该报错。"""
+    enqueue(env["db"], "gardener")
+    rc = A.main(["--db", str(env["db"]), "--ecdict", str(env["ecdict"]), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "请求体样例" not in out
+
+
 def test_cli_unknown_provider_returns_nonzero(env: dict, capsys):
     rc = A.main(["--db", str(env["db"]), "--provider", "gpt-9", "--once"])
     assert rc == 2 and "provider 初始化失败" in capsys.readouterr().out
