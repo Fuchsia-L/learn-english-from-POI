@@ -205,6 +205,60 @@ def test_prefetch_word_without_encounter_uses_episode_sentence(env: dict):
     assert pack["episode"] == "s01e01"
 
 
+def collect_web(client: TestClient, surface: str, sentence: str) -> dict:
+    r = client.post(
+        "/collect/web",
+        json={
+            "surface": surface,
+            "sentence": sentence,
+            "url": "https://example.invalid/a",
+            "title": "Example page",
+        },
+    )
+    assert r.status_code == 200
+    return r.json()
+
+
+def test_pack_uses_web_encounter_sentence(client: TestClient, env: dict):
+    """网页划词收藏（工单 11）：原句用网页那句，episode 写 "web"，没有时间戳。"""
+    sentence = "The tired gardener began a stakeout near the greenhouse door."
+    collect_web(client, "stakeouts", sentence)
+    p = FakeProvider()
+    with make_worker(env, provider=p) as w:
+        stats = w.run_once()
+    assert stats.done == 1
+    pack = p.calls[0][0]
+    assert pack["lemma"] == "stakeout" and pack["surface"] == "stakeouts"
+    assert pack["sentence"] == sentence
+    assert pack["episode"] == "web"
+    assert pack["t"] is None
+
+
+def test_pack_prefers_latest_encounter_with_a_sentence(client: TestClient, env: dict):
+    """网页收藏偶尔截不到句子；那条不该把上一次有原句的语境挤掉。"""
+    sentence = "Two cameras watched the empty office all night."
+    collect_web(client, "cameras", sentence)
+    r = client.post("/collect/web", json={"surface": "camera"})  # 没有 sentence
+    assert r.status_code == 200
+    p = FakeProvider()
+    with make_worker(env, provider=p) as w:
+        w.run_once()
+    pack = p.calls[0][0]
+    assert pack["sentence"] == sentence and pack["episode"] == "web"
+
+
+def test_pack_web_encounter_beats_subtitle_when_newer(client: TestClient, env: dict):
+    """两种来源都有：仍按"最近一条"取，网页那条在后就用网页那条。"""
+    collect(client, "cameras", seg_id(client, env["content_id"], idx=2))
+    web_sentence = "The cameras in the hallway were never switched on."
+    collect_web(client, "cameras", web_sentence)
+    p = FakeProvider()
+    with make_worker(env, provider=p) as w:
+        w.run_once()
+    pack = p.calls[0][0]
+    assert pack["sentence"] == web_sentence and pack["episode"] == "web"
+
+
 def test_ecdict_fields_backfilled_into_lexeme(env: dict):
     """Lexeme 骨架行（ingest 只写 lemma）在组包时被 ECDICT 补齐并回写缓存。"""
     enqueue(env["db"], "cousin", priority=0)
@@ -449,7 +503,7 @@ def test_budget_stops_mid_batch_retry_and_requeues(env: dict, logs: list):
     assert job_status(env["db"], job)["status"] == "queued"
 
 
-# --- 重试 / 失败 ------------------------------------------------------------
+# --- 重试 / 失败 -------------------------------------------------------------
 
 
 def test_retry_then_success(env: dict, logs: list):
