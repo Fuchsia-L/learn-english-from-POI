@@ -7,6 +7,7 @@ build_ecdict 的 mini 夹具（100 词自造条目），媒体用 os.urandom 生
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -754,3 +755,236 @@ def test_annotate_worker_closes_ecdict_too(env: dict):
     for conn in conns:
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+# --- POST /collect/web（浏览器划词插件，工单 11） --------------------------
+
+WEB_SENTENCE = "The tired gardener began a stakeout near the greenhouse door."
+WEB_URL = "https://example.invalid/notes/gardening"
+WEB_TITLE = "Gardening notes // example"
+EXT_ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+FF_ORIGIN = "moz-extension://11111111-2222-3333-4444-555555555555"
+
+
+def collect_web(client: TestClient, surface: str, **over) -> dict:
+    payload = {
+        "surface": surface,
+        "sentence": WEB_SENTENCE,
+        "url": WEB_URL,
+        "title": WEB_TITLE,
+    }
+    payload.update(over)
+    r = client.post("/collect/web", json=payload)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_collect_web_full_chain(client: TestClient, env: dict):
+    body = collect_web(client, "Stakeouts")
+    assert body["created"] is True and body["collected"] is True
+    assert body["lemma"] == "stakeout" and body["surface"] == "stakeouts"
+    assert body["job_created"] is True and body["encounters"] == 1
+    assert body["source_kind"] == "web"
+    assert body["sentence"] == WEB_SENTENCE and body["url"] == WEB_URL
+
+    conn = sqlite3.connect(str(env["db"]))
+    conn.row_factory = sqlite3.Row
+    enc = conn.execute("SELECT * FROM Encounter").fetchall()
+    assert len(enc) == 1
+    assert enc[0]["segment_id"] is None
+    assert enc[0]["source_kind"] == "web"
+    ctx = json.loads(enc[0]["context_json"])
+    assert ctx == {"url": WEB_URL, "title": WEB_TITLE, "sentence": WEB_SENTENCE}
+    # 词典没收录也建骨架 Lexeme + WordForm 映射（与 /collect 同口径）
+    assert conn.execute(
+        "SELECT id FROM Lexeme WHERE lemma='stakeout'"
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT lexeme_id FROM WordForm WHERE surface='stakeouts'"
+    ).fetchone() is not None
+    job = conn.execute("SELECT * FROM AnnotationJob").fetchall()
+    assert len(job) == 1 and job[0]["status"] == "queued"
+    assert job[0]["priority"] == 10  # 收藏永远高优先级插队
+    conn.close()
+
+
+def test_collect_web_repeat_only_adds_encounter(client: TestClient, env: dict):
+    first = collect_web(client, "stakeout")
+    second = collect_web(client, "Stakeouts", sentence="A second stakeout, same word.")
+    assert second["created"] is False
+    assert second["vocab_entry_id"] == first["vocab_entry_id"]
+    assert second["encounters"] == 2
+    assert second["job_created"] is False
+
+    conn = sqlite3.connect(str(env["db"]))
+    assert conn.execute("SELECT COUNT(*) FROM VocabEntry").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM Encounter").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM AnnotationJob").fetchone()[0] == 1
+    conn.close()
+
+
+def test_collect_web_shares_entry_with_subtitle_collect(client: TestClient, env: dict):
+    """同一个词，一次从剧里收、一次从网页收 → 同一个生词条目，两条相遇。"""
+    seg = first_segment_id(client, env["content_id"])
+    a = client.post("/collect", json={"surface": "home", "segment_id": seg}).json()
+    b = collect_web(client, "homes", sentence="He went to two homes today.")
+    assert b["vocab_entry_id"] == a["vocab_entry_id"]
+    assert b["encounters"] == 2
+    assert b["in_dict"] is True and b["ipa"] == "həʊm"  # 词典字段照样回填
+
+
+def test_collect_web_without_sentence_or_url(client: TestClient, env: dict):
+    """页面刁钻、句子/标题都没截到时也得收得下（只是语境为空）。"""
+    r = client.post("/collect/web", json={"surface": "gardener"})
+    assert r.status_code == 200
+    conn = sqlite3.connect(str(env["db"]))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM Encounter").fetchone()
+    assert json.loads(row["context_json"] or "{}") == {
+        "url": None, "title": None, "sentence": None
+    }
+    conn.close()
+
+
+def test_collect_web_bad_input(client: TestClient):
+    assert client.post("/collect/web", json={}).status_code == 422
+    assert client.post("/collect/web", json={"surface": ""}).status_code == 422
+    assert client.post("/collect/web", json={"surface": "!!!"}).status_code == 400
+
+
+def test_lookup_without_segment_reports_encounter_count(client: TestClient):
+    """插件开卡时就要显示「✓ 已收 · N 次相遇」，所以 /lookup 得给出次数。"""
+    before = client.get("/lookup", params={"surface": "stakeout"}).json()
+    assert before["collected"] is False and before["encounters"] == 0
+    assert before["segment_id"] is None and before["sentence"] is None
+    collect_web(client, "stakeout")
+    collect_web(client, "stakeouts")
+    after = client.get("/lookup", params={"surface": "Stakeout"}).json()
+    assert after["collected"] is True and after["encounters"] == 2
+
+
+def test_vocab_mixes_web_and_subtitle_encounters(client: TestClient, env: dict):
+    segs = client.get("/segments", params={"content_id": env["content_id"]}).json()[
+        "segments"
+    ]
+    client.post("/collect", json={"surface": "home", "segment_id": segs[0]["id"]})
+    collect_web(client, "homes", sentence="Two homes burned down.")
+    collect_web(client, "stakeout")
+
+    body = client.get("/vocab").json()
+    by_lemma = {v["lemma"]: v for v in body["vocab"]}
+    assert set(by_lemma) == {"home", "stakeout"}
+
+    home = by_lemma["home"]
+    assert home["encounter_count"] == 2
+    sub, web = home["encounters"]
+    assert sub["source_kind"] == "segment"
+    assert sub["sentence"] == segs[0]["text_en"] and sub["season_ep"] == "s01e01"
+    assert sub["content_id"] == env["content_id"] and sub["url"] is None
+    assert web["source_kind"] == "web"
+    assert web["sentence"] == "Two homes burned down."
+    assert web["title"] == WEB_TITLE and web["url"] == WEB_URL
+    # 网页来源没有时间轴 → 播放器不画「去这句」
+    assert web["segment_id"] is None
+    assert web["content_id"] is None and web["t_start"] is None
+
+    # 纯网页来源的词也能正常展开（LEFT JOIN 不能把它吃掉）
+    only_web = by_lemma["stakeout"]["encounters"][0]
+    assert only_web["source_kind"] == "web" and only_web["sentence"] == WEB_SENTENCE
+
+
+def test_review_next_serves_web_encounter(client: TestClient):
+    """复习卡的原句也要能来自网页收藏（review.py 与 /vocab 同一套口径）。"""
+    collect_web(client, "stakeout")
+    cards = client.get("/review/next").json()["cards"]
+    assert len(cards) == 1
+    enc = cards[0]["encounter"]
+    assert enc["source_kind"] == "web"
+    assert enc["sentence"] == WEB_SENTENCE
+    assert enc["url"] == WEB_URL and enc["title"] == WEB_TITLE
+    assert enc["segment_id"] is None and enc["t_start"] is None
+
+
+# --- CORS：只给插件、只给两个端点（工单 11） ------------------------------
+
+
+@pytest.mark.parametrize("origin", [EXT_ORIGIN, FF_ORIGIN])
+def test_cors_allows_extension_origin_on_two_endpoints(client: TestClient, origin: str):
+    r = client.get("/lookup", params={"surface": "home"}, headers={"Origin": origin})
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == origin
+    assert r.headers["vary"] == "Origin"
+
+    r2 = client.post(
+        "/collect/web", json={"surface": "home"}, headers={"Origin": origin}
+    )
+    assert r2.status_code == 200
+    assert r2.headers["access-control-allow-origin"] == origin
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "http://127.0.0.1:8000",
+        "null",
+        "chrome-extension://",             # 没有扩展 id
+        "https://chrome-extension://abcd",  # 前缀骗子
+    ],
+)
+def test_cors_denies_non_extension_origins(client: TestClient, origin: str):
+    r = client.get("/lookup", params={"surface": "home"}, headers={"Origin": origin})
+    assert r.status_code == 200                      # 服务端照常应答……
+    assert "access-control-allow-origin" not in r.headers  # ……但浏览器读不走
+
+
+@pytest.mark.parametrize(
+    "method,path,kwargs",
+    [
+        ("get", "/vocab", {}),
+        ("get", "/episodes", {}),
+        ("get", "/segments", {"params": {"content_id": 1}}),
+        ("get", "/review/next", {}),
+        ("get", "/mnemonic", {"params": {"lexeme_id": 1}}),
+        ("post", "/collect", {"json": {"surface": "home", "segment_id": 1}}),
+    ],
+)
+def test_cors_not_granted_to_other_endpoints(client: TestClient, method, path, kwargs):
+    r = getattr(client, method)(path, headers={"Origin": EXT_ORIGIN}, **kwargs)
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_cors_preflight_only_for_allowed_pair(client: TestClient):
+    ok = client.options(
+        "/collect/web",
+        headers={
+            "Origin": EXT_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert ok.status_code == 204
+    assert ok.headers["access-control-allow-origin"] == EXT_ORIGIN
+    assert "POST" in ok.headers["access-control-allow-methods"]
+    assert ok.headers["access-control-allow-headers"] == "Content-Type"
+
+    # 无关端点 / 无关 origin 的预检不给放行头（走正常路由，405）
+    bad_path = client.options(
+        "/vocab",
+        headers={"Origin": EXT_ORIGIN, "Access-Control-Request-Method": "GET"},
+    )
+    assert "access-control-allow-origin" not in bad_path.headers
+    bad_origin = client.options(
+        "/collect/web",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert "access-control-allow-origin" not in bad_origin.headers
+
+
+def test_no_cors_headers_without_origin(client: TestClient):
+    r = client.get("/lookup", params={"surface": "home"})
+    assert "access-control-allow-origin" not in r.headers
+    assert "vary" not in r.headers

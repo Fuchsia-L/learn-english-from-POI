@@ -563,7 +563,7 @@ def test_view_tabs_switch_and_video_state_is_restored(player):
     set_view(player, "vocab")                       # 切走：自动暂停
     assert player.locator("#view-play").is_hidden()
     assert player.evaluate("document.getElementById('video').paused") is True
-    # 生词本界面是全屏的，播放界面的顶栏控件跟着收起
+    # 生词本界面是全屏的，播放界面的顶栏控件跟着收起来
     assert player.locator("#modes").is_hidden()
     assert player.locator("#ep").is_hidden()
 
@@ -748,3 +748,46 @@ def test_no_browser_storage_api_is_used(player):
         assert banned not in text
     assert player.evaluate("window.localStorage.length") == 0
     assert player.evaluate("window.sessionStorage.length") == 0
+
+
+# --- 网页来源的相遇（工单 11：划词插件收的词也进这个生词本） ----------------
+
+WEB_WORD = "wardrobes"
+WEB_SENTENCE = "The old wardrobes in the hallway were never opened."
+WEB_TITLE = "Fixture notes // POI"
+WEB_URL = "https://example.invalid/notes"
+
+
+def test_vocab_shows_web_encounter_without_jump(player, server_url):
+    """插件收的相遇：显示 🌐 页面标题 + 整句，且**没有**「去这句」（网页没时间轴）。"""
+    req = urllib.request.Request(
+        server_url + "/collect/web",
+        data=json.dumps(
+            {
+                "surface": WEB_WORD,
+                "sentence": WEB_SENTENCE,
+                "url": WEB_URL,
+                "title": WEB_TITLE,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert json.loads(resp.read())["lemma"] == "wardrobe"
+
+    set_view(player, "vocab")
+    player.wait_for_selector("#vlist .vcard")
+    card = player.locator("#vlist .vcard").filter(has_text="wardrobe").first
+    enc = card.locator(".enc").first
+    text = enc.inner_text().replace("\n", " ")
+    assert "🌐 " + WEB_TITLE in text
+    assert WEB_SENTENCE in text
+    assert WEB_WORD in text
+    assert enc.locator(".jump").count() == 0          # 跳不回去，就别画按钮
+    assert enc.locator(".meta").first.get_attribute("title") == WEB_URL
+
+    # 字幕来源的那些卡照旧有「去这句」（两种来源同屏共存）
+    subtitle_card = card.page.locator("#vlist .vcard").filter(has_text="stakeout")
+    if subtitle_card.count():
+        assert subtitle_card.first.locator(".enc .jump").count() >= 1
