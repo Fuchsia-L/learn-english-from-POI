@@ -19,7 +19,7 @@
    schema；缺 id / id 不在本批 / 重复 id / 不合 schema 的元素丢弃，对应任务下一轮
    只重试没对上的那些；
 4. 写 Mnemonic：context_gloss 单独一行 kind="gloss"，每个 hook 按 type 拆行存；
-   version 递增；**edited_by_user=1 的那个 kind 永不被覆盖**；
+   version 递增；**edited_by_user=1 的那个 kind 永不覆盖**；
 5. job 置 done / failed（重试 --retries 次后仍失败才置 failed）。
 
 预算制（工单 6-1 修）：estimate_cost 的累计与 --budget 检查发生在**每一次真实
@@ -776,7 +776,7 @@ def payload_sample(provider: Provider, packs: Sequence[dict], batch_size: int) -
     """provider **真会发出去**的请求体，离线组装：不发包、不读 key、不含鉴权头。
 
     上线前用它眼验两件最花钱的事：模型名对不对（--model 有没有真的透传到请求体）、
-    thinking 有没有开（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
+    thinking 有没有关（工单 8a）。messages 里全是 prompt 正文，这儿折成一行摘要，
     想看正文用 provider.dump_prompt(batch)。provider 没有 payload()（比如 fake）
     就返回 None，调用方跳过这行。
     """
