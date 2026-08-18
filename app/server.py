@@ -1,21 +1,21 @@
-"""FastAPI 服务:API + Range 媒体接口 + 静态托管 player(DESIGN.md §3 §4)。
+"""FastAPI 服务：API + Range 媒体接口 + 静态托管 player（DESIGN.md §3 §4）。
 
 启动:
     uvicorn app.server:app                      # 读环境变量 POI_DB / POI_ECDICT
     python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000
 
-约定(与 db.py / ingest.py / build_ecdict.py 对齐):
-- 一切查询走 SQLite,本模块**不做任何网络调用**(LLM 由 annotate worker 负责)。
-- surface 一律小写归一(ingest.normalize_surface),WordForm 主键即小写 surface。
-- Lexeme 是客观词典缓存:ingest 只建骨架行(pos/ipa/dict_gloss 为 NULL),
+约定（与 db.py / ingest.py / build_ecdict.py 对齐）:
+- 一切查询走 SQLite，本模块**不做任何网络调用**（LLM 由 annotate worker 负责）。
+- surface 一律小写归一（ingest.normalize_surface），WordForm 主键即小写 surface。
+- Lexeme 是客观词典缓存：ingest 只建骨架行（pos/ipa/dict_gloss 为 NULL），
   首次 /lookup 或 /collect 时从 ecdict.db 回填。
-- ECDICT 查询/回填口径住在 **app/ecdict.py**(工单 9 抽层):server 与 annotate
-  worker 共用同一份实现,worker 不再反向依赖 web 层。
-- 释义里的字面 "\n" 分隔符原样吐给前端,服务端不折行。
-- ecdict.db 不存在/损坏时优雅降级:in_dict=false,不 500。
-- 连接每线程一条并登记在册(app/db.py 的 Database/ConnRegistry),
-  lifespan 退出时统一 close(Windows 不锁库文件)。
-- 复习闭环(M1):规则与 SQL 住在 **app/review.py**(纯 SQLite),本模块只做
+- ECDICT 查询/回填口径住在 **app/ecdict.py**（工单 9 抽层）：server 与 annotate
+  worker 共用同一份实现，worker 不再反向依赖 web 层。
+- 释义里的字面 "\\n" 分隔符原样吐给前端，服务端不折行。
+- ecdict.db 不存在/损坏时优雅降级：in_dict=false，不 500。
+- 连接每线程一条并登记在册（app/db.py 的 Database/ConnRegistry），
+  lifespan 退出时统一 close（Windows 不锁库文件）。
+- 复习闭环（M1）：规则与 SQL 住在 **app/review.py**（纯 SQLite），本模块只做
   HTTP 壳子 —— /review/next、/review/answer、/review/stats。
 """
 
@@ -49,13 +49,13 @@ from app.ecdict import EcdictStore, fill_from_ecdict
 from app.ingest import lemmatize, normalize_surface
 
 MEDIA_CHUNK = 64 * 1024
-# 单 Range:`bytes=0-1023` / `bytes=1024-` / `bytes=-500`;多 Range 只取第一段
+# 单 Range：`bytes=0-1023` / `bytes=1024-` / `bytes=-500`；多 Range 只取第一段
 _RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*(?:,.*)?$", re.IGNORECASE)
 
-# --- 浏览器扩展的 CORS 白名单(工单 11) ------------------------------------
-# 服务只听 127.0.0.1,但「本机的任意网页」都能往它上面发请求 —— 浏览器的同源策略
-# 是这里唯一的门。所以只给划词插件真正要用的两个端点开口子,且只认扩展 origin:
-# 收藏/查词以外的端点(/media、/segments、/review/...)一律不放,
+# --- 浏览器扩展的 CORS 白名单（工单 11） ------------------------------------
+# 服务只听 127.0.0.1，但「本机的任意网页」都能往它上面发请求 —— 浏览器的同源策略
+# 是这里唯一的门。所以只给划词插件真正要用的两个端点开口子，且只认扩展 origin：
+# 收藏/查词以外的端点（/media、/segments、/review/...）一律不放，
 # 随便哪个网页的 JS 都读不走生词本。
 _EXT_ORIGIN_RE = re.compile(r"^(chrome|moz)-extension://[A-Za-z0-9._{}-]+/?$")
 CORS_PATHS = frozenset({"/lookup", "/collect/web"})
@@ -63,20 +63,20 @@ CORS_MAX_AGE = b"600"
 
 
 def is_extension_origin(origin: str | None) -> bool:
-    """Origin 是不是浏览器扩展(chrome-extension:// / moz-extension://)。"""
+    """Origin 是不是浏览器扩展（chrome-extension:// / moz-extension://）。"""
     return bool(origin) and _EXT_ORIGIN_RE.match(origin or "") is not None
 
 
 class ExtensionCORS:
     """按 (path, origin) 双条件放行的 CORS 中间件。
 
-    不用 starlette 的 CORSMiddleware:那玩意是全局的,一开就等于给**所有**端点
-    发通行证;本机上任何网页的 JS 都能把生词本读走。这里只认两个端点 + 扩展
-    origin,其余请求连 Vary 都不加。
+    不用 starlette 的 CORSMiddleware：那玩意是全局的，一开就等于给**所有**端点
+    发通行证；本机上任何网页的 JS 都能把生词本读走。这里只认两个端点 + 扩展
+    origin，其余请求连 Vary 都不加。
 
-    写成裸 ASGI 类而不是 `@app.middleware("http")`:后者是 BaseHTTPMiddleware,
-    每个响应都要多包一层任务,视频 Range 流也得从它身上过 —— 明明只关心两个
-    端点,没道理让 /media 陪跑。这里不相干的 scope 直接原样透传。
+    写成裸 ASGI 类而不是 `@app.middleware("http")`：后者是 BaseHTTPMiddleware，
+    每个响应都要多包一层任务，视频 Range 流也得从它身上过 —— 明明只关心两个
+    端点，没道理让 /media 陪跑。这里不相干的 scope 直接原样透传。
     """
 
     ALLOW_METHODS = b"GET, POST, OPTIONS"
@@ -102,7 +102,7 @@ class ExtensionCORS:
             return
         allow_origin = (origin or "").encode("latin-1")
 
-        # 预检:只有放行组合才自己应答,其余(含无关端点/无关 origin)交给路由
+        # 预检：只有放行组合才自己应答，其余（含无关端点/无关 origin）交给路由
         if scope.get("method") == "OPTIONS" and self._header(
             scope, b"access-control-request-method"
         ):
@@ -138,7 +138,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --- Lexeme 词典字段回填(口径见 app/ecdict.py) ---------------------------
+# --- Lexeme 词典字段回填（口径见 app/ecdict.py） ---------------------------
 
 
 def _lexeme_row(conn: sqlite3.Connection, lexeme_id: int) -> sqlite3.Row | None:
@@ -150,7 +150,7 @@ def _lexeme_row(conn: sqlite3.Connection, lexeme_id: int) -> sqlite3.Row | None:
 def _resolve_surface(
     conn: sqlite3.Connection, surface: str
 ) -> tuple[str, sqlite3.Row | None]:
-    """小写 surface → (lemma, Lexeme 行或 None)。只读,不建行。"""
+    """小写 surface → (lemma, Lexeme 行或 None)。只读，不建行。"""
     row = conn.execute(
         "SELECT L.id, L.lemma, L.pos, L.ipa, L.dict_gloss FROM WordForm W "
         "JOIN Lexeme L ON L.id = W.lexeme_id WHERE W.surface = ?",
@@ -168,8 +168,8 @@ def _resolve_surface(
 def _entry_stats(conn: sqlite3.Connection, lexeme_id: int | None) -> tuple[bool, int]:
     """(是否已收藏, 相遇次数)。没收藏就是 (False, 0)。
 
-    次数是给查询卡显示「✓ 已收 · N 次相遇」用的(工单 11 划词插件):
-    收藏前后都要能显示同一句话,不然刚打开的卡和刚收完的卡对不上。
+    次数是给查询卡显示「✓ 已收 · N 次相遇」用的（工单 11 划词插件）：
+    收藏前后都要能显示同一句话，不然刚打开的卡和刚收完的卡对不上。
     """
     if lexeme_id is None:
         return False, 0
@@ -207,7 +207,7 @@ def _loads(raw: str | None, default: Any) -> Any:
 
 class RangeSpec(BaseModel):
     start: int
-    end: int  # 闭区间,含
+    end: int  # 闭区间，含
 
     @property
     def length(self) -> int:
@@ -218,9 +218,9 @@ def parse_range(header: str | None, size: int) -> tuple[str, RangeSpec | None]:
     """解析 Range 头。
 
     返回 ('full'|'partial'|'unsatisfiable', spec)。
-    - 语法非法 / 非 bytes 单位 → 'full'(RFC 9110:无法理解的 Range 必须忽略)
-    - first-byte-pos 越界、suffix-length=0、空文件 → 'unsatisfiable'(416)
-    - 多 Range 只取第一段(M0 用不到 multipart/byteranges)
+    - 语法非法 / 非 bytes 单位 → 'full'（RFC 9110：无法理解的 Range 必须忽略）
+    - first-byte-pos 越界、suffix-length=0、空文件 → 'unsatisfiable'（416）
+    - 多 Range 只取第一段（M0 用不到 multipart/byteranges）
     """
     if not header:
         return "full", None
@@ -263,7 +263,7 @@ def _media_type(path: Path) -> str:
     guessed, _ = mimetypes.guess_type(str(path))
     if guessed and guessed.split("/")[0] in ("video", "audio"):
         return guessed
-    return "video/mp4"  # <video> 需要一个可播的类型,未知后缀按 mp4 试
+    return "video/mp4"  # <video> 需要一个可播的类型，未知后缀按 mp4 试
 
 
 # --- 请求体 ----------------------------------------------------------------
@@ -276,9 +276,9 @@ class CollectIn(BaseModel):
 
 
 class CollectWebIn(BaseModel):
-    """POST /collect/web:浏览器划词插件的收藏(工单 11)。
+    """POST /collect/web：浏览器划词插件的收藏（工单 11）。
 
-    除 surface 外全可空 —— 插件在再钻的页面上也能退化成"光收词",
+    除 surface 外全可空 —— 插件在再刁钻的页面上也能退化成"光收词"，
     不因为句子没截到 / 页面没标题就收藏失败。
     """
 
@@ -291,7 +291,7 @@ class CollectWebIn(BaseModel):
 
 class ReviewAnswerIn(BaseModel):
     """POST /review/answer 的请求体。result 的合法值校验放在 app/review.py
-    (规则归规则层),这里只要求非空字符串 —— 非法值回 400 而不是 422。"""
+    （规则归规则层），这里只要求非空字符串 —— 非法值回 400 而不是 422。"""
 
     vocab_entry_id: int = Field(..., ge=1)
     result: str = Field(..., min_length=1)
@@ -304,20 +304,20 @@ def create_app(
     db_path: str | Path | None = None,
     ecdict_path: str | Path | None = None,
 ) -> FastAPI:
-    """建 app。参数优先,其次环境变量 POI_DB / POI_ECDICT,最后默认值。"""
+    """建 app。参数优先，其次环境变量 POI_DB / POI_ECDICT，最后默认值。"""
     db_file = Path(db_path or os.environ.get("POI_DB") or DEFAULT_DB)
     ecdict_file = Path(ecdict_path or os.environ.get("POI_ECDICT") or DEFAULT_ECDICT)
 
-    # 建表在首个请求触发(Database._ensure_schema,幂等)—— import 阶段不碰磁盘
+    # 建表在首个请求触发（Database._ensure_schema，幂等）——import 阶段不碰磁盘
     db = Database(db_file)
     ecdict = EcdictStore(ecdict_file)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        """进程退出时把两个库的**所有线程**连接都关掉(工单 6-4)。
+        """进程退出时把两个库的**所有线程**连接都关掉（工单 6-4）。
 
-        不关的后果在 Windows 上是实锉的:uvicorn 停了,poi.db / ecdict.db 仍被
-        锁着,用户删不掉也重建不了词典。Linux 上删得掉,但 WAL 文件照样残留。
+        不关的后果在 Windows 上是实锤的：uvicorn 停了，poi.db / ecdict.db 仍被
+        锁着，用户删不掉也重建不了词典。Linux 上删得掉，但 WAL 文件照样残留。
         """
         yield
         closed = db.close_all() + ecdict.close_all()
@@ -327,7 +327,7 @@ def create_app(
     app = FastAPI(
         title="learn-english-from-POI",
         version="0.2",
-        description="本地看剧学词服务:字幕点词 → 查词 → 收藏 → 助记(DESIGN.md §3)",
+        description="本地看剧学词服务：字幕点词 → 查词 → 收藏 → 助记（DESIGN.md §3）",
         lifespan=lifespan,
     )
     app.state.db = db
@@ -335,12 +335,12 @@ def create_app(
     app.state.db_path = db_file
     app.state.ecdict_path = ecdict_file
 
-    # CORS:只给划词插件的两个端点开口子(工单 11,实现见 ExtensionCORS)
+    # CORS：只给划词插件的两个端点开口子（工单 11，实现见 ExtensionCORS）
     app.add_middleware(ExtensionCORS)
 
     static_dir = Path(__file__).resolve().parent / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
-    # player.html 还没落地也不影响挂载(check_dir=False 兜底目录被删的情况)
+    # player.html 还没落地也不影响挂载（check_dir=False 兜底目录被删的情况）
     app.mount("/static", StaticFiles(directory=str(static_dir), check_dir=False), name="static")
 
     # ---- 根路径 -----------------------------------------------------------
@@ -376,7 +376,7 @@ def create_app(
             )
         return {"episodes": out}
 
-    # ---- GET /media/{content_id} (Range) --------------------------------
+    # ---- GET /media/{content_id} （Range） --------------------------------
 
     @app.api_route("/media/{content_id}", methods=["GET", "HEAD"])
     def media(content_id: int, request: Request) -> Response:
@@ -396,7 +396,7 @@ def create_app(
 
         size = path.stat().st_size
         media_type = _media_type(path)
-        if request.method == "HEAD":  # 探测文件大小/可 Range,不吐字节
+        if request.method == "HEAD":  # 探测文件大小/可 Range，不吐字节
             return Response(
                 status_code=200,
                 media_type=media_type,
@@ -501,7 +501,7 @@ def create_app(
             "sentence": sentence,
         }
 
-    # ---- 收藏(/collect 与 /collect/web 共用的一条链路) -------------------
+    # ---- 收藏（/collect 与 /collect/web 共用的一条链路） -------------------
 
     def _collect_core(
         norm: str,
@@ -513,8 +513,8 @@ def create_app(
     ) -> dict:
         """Lexeme(缺则建) + WordForm + VocabEntry + Encounter + 高优先 job。
 
-        两种来源唯一的差别只在 Encounter 那一行(segment_id / source_kind /
-        context_json);词元归一、幂等口径、入队策略完全共用,不许分叉。
+        两种来源唯一的差别只在 Encounter 那一行（segment_id / source_kind /
+        context_json）；词元归一、幂等口径、入队策略完全共用，不许分叉。
         """
         conn = db.conn()
         lemma, lexeme = _resolve_surface(conn, norm)
@@ -525,7 +525,7 @@ def create_app(
                 lexeme_id = int(cur.lastrowid)
             else:
                 lexeme_id = int(lexeme["id"])
-            # 点击的形式没进过 ingest(前端手动输入/OCR 变体)时补一条映射
+            # 点击的形式没进过 ingest（前端手动输入/OCR 变体）时补一条映射
             conn.execute(
                 "INSERT INTO WordForm (surface, lexeme_id) VALUES (?, ?) "
                 "ON CONFLICT (surface) DO NOTHING",
@@ -551,7 +551,7 @@ def create_app(
                         (note, vocab_entry_id),
                     )
 
-            # 幂等口径:重复收藏只加 Encounter
+            # 幂等口径：重复收藏只加 Encounter
             cur = conn.execute(
                 "INSERT INTO Encounter "
                 "(vocab_entry_id, segment_id, surface, added_at, source_kind, context_json) "
@@ -567,7 +567,7 @@ def create_app(
             )
             encounter_id = int(cur.lastrowid)
 
-            # 已有未完成(或已完成)的 job 不重复建;failed 允许重排
+            # 已有未完成（或已完成）的 job 不重复建；failed 允许重排
             job = conn.execute(
                 "SELECT id, status FROM AnnotationJob WHERE lexeme_id = ? "
                 "AND status IN ('queued','running','done') ORDER BY id DESC LIMIT 1",
@@ -582,13 +582,13 @@ def create_app(
                 job_id, job_created = int(cur.lastrowid), True
             else:
                 job_id, job_created = int(job["id"]), False
-                # 收藏永远插队(预热任务是低优先级,见 DESIGN §5)
+                # 收藏永远插队（预热任务是低优先级，见 DESIGN §5）
                 conn.execute(
                     "UPDATE AnnotationJob SET priority = ? WHERE id = ? AND priority < ?",
                     (COLLECT_JOB_PRIORITY, job_id, COLLECT_JOB_PRIORITY),
                 )
 
-        # 收藏时顺手把词典字段补上,生词本立刻能显示释义
+        # 收藏时顺手把词典字段补上，生词本立刻能显示释义
         lexeme_row = _lexeme_row(conn, lexeme_id)
         fields, in_dict = fill_from_ecdict(conn, ecdict, lexeme_row, lemma, norm)
         n_enc = conn.execute(
@@ -635,14 +635,14 @@ def create_app(
             source_kind=SOURCE_SEGMENT,
         )
 
-    # ---- POST /collect/web (浏览器划词插件,工单 11) ---------------------
+    # ---- POST /collect/web （浏览器划词插件，工单 11） ---------------------
 
     @app.post("/collect/web")
     def collect_web(payload: CollectWebIn = Body(...)) -> dict:
-        """网页划词收藏:没有 segment,语境是页面上截到的整句 + 出处。
+        """网页划词收藏：没有 segment，语境是页面上截到的整句 + 出处。
 
-        与 /collect 同一条链路、同一套幂等口径(重复收藏只加 encounter),
-        差别只有 Encounter 那一行:segment_id 为空,语境进 context_json。
+        与 /collect 同一条链路、同一套幂等口径（重复收藏只加 encounter），
+        差别只有 Encounter 那一行：segment_id 为空，语境进 context_json。
         """
         norm = _clean_surface(payload.surface)
         if not norm:
@@ -685,8 +685,8 @@ def create_app(
         ).fetchall()
         by_entry: dict[int, list[dict]] = {i: [] for i in ids}
         for r in enc_rows:
-            # 两种来源同一套键名(app/db.py encounter_view):字幕段给时间轴,
-            # 网页给 url/标题;前端按 source_kind 决定画不画「去这句」
+            # 两种来源同一套键名（app/db.py encounter_view）：字幕段给时间轴，
+            # 网页给 url/标题；前端按 source_kind 决定画不画「去这句」
             by_entry[int(r["vocab_entry_id"])].append(encounter_view(r))
 
         lex_ids = [int(e["lexeme_id"]) for e in entries]
@@ -769,18 +769,18 @@ def create_app(
             "job": dict(job) if job is not None else None,
         }
 
-    # ---- 复习闭环(M1,规则见 app/review.py) -----------------------------
+    # ---- 复习闭环（M1，规则见 app/review.py） -----------------------------
 
     @app.get("/review/next")
     def review_next(
         limit: int = Query(review_rules.DEFAULT_LIMIT, ge=1, le=review_rules.MAX_LIMIT),
     ) -> dict:
-        """今日待复习卡(含 remaining:整个队列还剩多少,不受 limit 影响)。"""
+        """今日待复习卡（含 remaining：整个队列还剩多少，不受 limit 影响）。"""
         return review_rules.next_cards(db.conn(), limit=limit)
 
     @app.post("/review/answer")
     def review_answer(payload: ReviewAnswerIn = Body(...)) -> dict:
-        """记一次「会 / 不会」。当天重复提交同一答案幂等(duplicate=true)。"""
+        """记一次「会 / 不会」。当天重复提交同一答案幂等（duplicate=true）。"""
         conn = db.conn()
         try:
             return review_rules.answer(
@@ -793,7 +793,7 @@ def create_app(
 
     @app.get("/review/stats")
     def review_stats() -> dict:
-        """今日已复习 / 待复习 / 毕业总数(UTC 日历日)。"""
+        """今日已复习 / 待复习 / 毕业总数（UTC 日历日）。"""
         return review_rules.stats(db.conn())
 
     return app
@@ -808,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     ap = argparse.ArgumentParser(
-        prog="python -m app.server", description="本地看剧学词服务(DESIGN §3)"
+        prog="python -m app.server", description="本地看剧学词服务（DESIGN §3）"
     )
     ap.add_argument("--db", default=os.environ.get("POI_DB", DEFAULT_DB))
     ap.add_argument("--ecdict", default=os.environ.get("POI_ECDICT", DEFAULT_ECDICT))
