@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import urllib.request
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import build_ecdict  # noqa: E402
 
+from app import review as review_rules  # noqa: E402
 from app.annotate import AnnotateWorker  # noqa: E402
+from app.db import init_db  # noqa: E402
 from app.ingest import ingest_srt, tokenize  # noqa: E402
 from app.providers.fake import GLOSS_PREFIX, FakeProvider  # noqa: E402
 from app.server import create_app  # noqa: E402
@@ -207,12 +210,12 @@ def workspace(tmp_path_factory) -> dict:
     return {"dir": d, "db": db, "ecdict": ecdict, "video": video, "dark": dark_video}
 
 
-@pytest.fixture(scope="module")
-def server_url(workspace: dict):
+def serve(db: Path, ecdict: Path):
+    """在后台线程里起一个真 uvicorn，返回 (url, 关停函数)。"""
     import uvicorn
 
     port = free_port()
-    app = create_app(db_path=workspace["db"], ecdict_path=workspace["ecdict"])
+    app = create_app(db_path=db, ecdict_path=ecdict)
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     )
@@ -222,9 +225,19 @@ def server_url(workspace: dict):
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
     assert server.started, "uvicorn 没起来"
-    yield f"http://127.0.0.1:{port}"
-    server.should_exit = True
-    thread.join(timeout=10)
+
+    def stop():
+        server.should_exit = True
+        thread.join(timeout=10)
+
+    return f"http://127.0.0.1:{port}", stop
+
+
+@pytest.fixture(scope="module")
+def server_url(workspace: dict):
+    url, stop = serve(workspace["db"], workspace["ecdict"])
+    yield url
+    stop()
 
 
 @pytest.fixture()
@@ -550,10 +563,12 @@ def test_click_outside_card_closes_it(player):
 def test_view_tabs_switch_and_video_state_is_restored(player):
     """播放是主界面，生词本是另一个界面；切走暂停、切回恢复原状态。"""
     tabs = player.eval_on_selector_all("#tabs button", "bs => bs.map(b => b.textContent)")
-    assert tabs == ["[ 播放 ]", "[ 内容库 ]", "[ 生词本 ]"]    # 内容库见工单 12
+    # 内容库见工单 12，复习见工单 14
+    assert tabs == ["[ 播放 ]", "[ 内容库 ]", "[ 生词本 ]", "[ 复习 ]"]
     assert player.locator("#view-play").is_visible()
     assert player.locator("#view-vocab").is_hidden()
     assert player.locator("#view-lib").is_hidden()
+    assert player.locator("#view-review").is_hidden()
 
     goto_segment(player, 1)
     player.evaluate("document.getElementById('video').play()")
@@ -566,7 +581,9 @@ def test_view_tabs_switch_and_video_state_is_restored(player):
     assert player.locator("#modes").is_hidden()
     assert player.locator("#ep").is_hidden()
 
-    player.keyboard.press("v")                      # v 切回：恢复播放
+    player.keyboard.press("v")                      # v 循环：生词本 → 复习
+    player.wait_for_selector("#view-review.on")
+    player.keyboard.press("v")                      # → 转回播放：恢复播放
     player.wait_for_selector("#view-play.on")
     player.wait_for_function("() => !document.getElementById('video').paused")
 
@@ -575,6 +592,8 @@ def test_view_tabs_switch_and_video_state_is_restored(player):
     player.wait_for_selector("#view-lib.on")
     player.keyboard.press("v")                      # → 生词本
     player.wait_for_selector("#view-vocab.on")
+    player.keyboard.press("v")                      # → 复习
+    player.wait_for_selector("#view-review.on")
     player.keyboard.press("v")                      # → 转回播放
     player.wait_for_selector("#view-play.on")
     # 切走前是暂停的，切回来就不许自己播起来
@@ -792,3 +811,252 @@ def test_vocab_shows_web_encounter_without_jump(player, server_url):
     subtitle_card = card.page.locator("#vlist .vcard").filter(has_text="stakeout")
     if subtitle_card.count():
         assert subtitle_card.first.locator(".enc .jump").count() >= 1
+
+
+# --- 复习界面（工单 14：间隔重复简化版 + 翻卡答题） -------------------------
+#
+# 复习会**改库**（写 Review 行），所以另起一套夹具：独立 db + 独立 uvicorn，
+# 免得把上面那些用例的生词本搅了。素材还是同一批自造 srt / 视频 / mini 词典。
+
+
+@pytest.fixture(scope="module")
+def review_workspace(workspace: dict, tmp_path_factory) -> dict:
+    d = tmp_path_factory.mktemp("review_e2e")
+    db = d / "poi.db"
+    stats = ingest_srt(
+        db_path=db,
+        srt_path=workspace["dir"] / "ep.srt",
+        title="Fixture Show",
+        season_ep="s01e01",
+        video_path=str(workspace["video"]),
+        boxes_path=workspace["dir"] / "ep.boxes.json",
+    )
+    assert stats["segments"] == 3
+    return {"dir": d, "db": db, "ecdict": workspace["ecdict"]}
+
+
+@pytest.fixture(scope="module")
+def review_url(review_workspace: dict):
+    url, stop = serve(review_workspace["db"], review_workspace["ecdict"])
+    yield url
+    stop()
+
+
+@pytest.fixture()
+def rplayer(page, review_url: str):
+    """复习专用的播放器页面（对着复习那套服务），同样盯 JS 报错。"""
+    errors: list[str] = []
+    page.on("pageerror", lambda e: errors.append("pageerror: " + str(e)))
+    page.on(
+        "console",
+        lambda m: errors.append("console: " + m.text) if m.type == "error" else None,
+    )
+    page.goto(review_url + "/static/player.html")
+    page.wait_for_selector("#ep option[value]", state="attached")
+    yield page
+    assert errors == [], f"页面有 JS 报错: {errors}"
+
+
+def http_json(url: str, path: str, payload: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        url + path,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+        headers={} if payload is None else {"Content-Type": "application/json"},
+        method="GET" if payload is None else "POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def collect_words(url: str, surfaces: list[str]) -> list[dict]:
+    """直接走 HTTP 收几个词（比在画面上点快，且不依赖词框）。"""
+    cid = http_json(url, "/episodes")["episodes"][0]["id"]
+    segs = http_json(url, f"/segments?content_id={cid}")["segments"]
+    out = []
+    for s in surfaces:
+        seg = next(x for x in segs if s in x["text_en"].lower())
+        out.append(http_json(url, "/collect", {"surface": s, "segment_id": seg["id"]}))
+    return out
+
+
+def open_review(page) -> None:
+    page.click("#tabs button[data-view='review']")
+    page.wait_for_selector("#view-review.on")
+
+
+def review_left(page) -> int:
+    """顶部「今日剩余 N」的 N。"""
+    return int(page.inner_text("#rcount").split("今日剩余 ")[1].split(" ")[0])
+
+
+def test_review_front_hides_the_answer_and_space_flips(rplayer, review_url):
+    collect_words(review_url, ["stakeout"])
+    open_review(rplayer)
+
+    rplayer.wait_for_selector("#rcard[data-state='front']")
+    assert rplayer.inner_text("#rcard .rlemma .lmtext") == "stakeout"
+    assert "ˈsteɪkaʊt" in rplayer.inner_text("#rcard .ripa")
+    # 正面：例句里的目标词被遮住，释义/助记整块不可见
+    sent = rplayer.inner_text("#rcard .rsent .sbody")
+    assert "▓" in sent and "stakeout" not in sent.lower()
+    assert SEG_TEXT[1].split("stakeout")[0].strip() in sent   # 句子其余部分照常
+    assert rplayer.locator("#rcard .rback").is_hidden()
+    assert rplayer.locator("#rcard .rsent .blank").count() == 1
+    # 新词的档位标记
+    assert "stage 0/3" in rplayer.inner_text("#rcard .rmeta")
+    assert review_left(rplayer) == 1
+    assert "间隔 1/3/7 天 · 答对 3 次毕业" in rplayer.inner_text("#rstage")
+
+    rplayer.keyboard.press(" ")                       # 空格翻卡
+    rplayer.wait_for_selector("#rcard[data-state='revealed']")
+    gloss = rplayer.inner_text("#rcard .rgloss")
+    assert "盯梢" in gloss and "蹲守盯住" in gloss      # 两行词典释义都拆开了
+    # 翻开之后例句把原词还回来（高亮），不再是 ▓▓▓
+    revealed = rplayer.inner_text("#rcard .rsent .sbody")
+    assert "stakeout" in revealed and "▓" not in revealed
+    assert rplayer.inner_text("#rcard .rsent .hit") == "stakeout"
+    # 快捷键提示在状态栏
+    assert "[J] 会" in rplayer.inner_text("#status")
+
+
+def test_review_shortcuts_answer_and_advance(rplayer, review_url):
+    collect_words(review_url, ["cousin", "driver"])
+    open_review(rplayer)
+    rplayer.wait_for_selector("#rcard")
+    assert review_left(rplayer) == 3
+
+    first = rplayer.locator("#rcard").get_attribute("data-lemma")
+    rplayer.keyboard.press("j")                       # J = 会
+    rplayer.wait_for_function(
+        "lemma => { const n = document.getElementById('rcard');"
+        " return n && n.dataset.lemma !== lemma; }", arg=first
+    )
+    assert review_left(rplayer) == 2
+    assert "今日已复习 1" in rplayer.inner_text("#rcount")
+    assert "答对率 100%" in rplayer.inner_text("#rcount")
+    # 新卡片是正面朝上的（上一张翻开过也不影响）
+    assert rplayer.locator("#rcard").get_attribute("data-state") == "front"
+
+    second = rplayer.locator("#rcard").get_attribute("data-lemma")
+    rplayer.click("#rdont")                           # 按钮和快捷键同一条路径
+    rplayer.wait_for_function(
+        "lemma => { const n = document.getElementById('rcard');"
+        " return n && n.dataset.lemma !== lemma; }", arg=second
+    )
+    assert review_left(rplayer) == 1
+    assert "今日已复习 2" in rplayer.inner_text("#rcount")
+    assert "答对率 50%" in rplayer.inner_text("#rcount")
+
+    # 后端确实落库了（不只是前端数着玩）
+    s = http_json(review_url, "/review/stats")
+    assert s["reviewed_today"] == 2 and s["know_today"] == 1 and s["dont_today"] == 1
+    assert s["due"] == 1
+
+
+def test_review_mnemonic_not_ready_does_not_block(rplayer, review_workspace, review_url):
+    """助记还在生成：显示"生成中"，答题照常（DESIGN §5 助记是旁路）。"""
+    open_review(rplayer)
+    rplayer.wait_for_selector("#rcard")
+    rplayer.keyboard.press(" ")
+    rplayer.wait_for_selector("#rcard[data-state='revealed']")
+    assert rplayer.locator("#rmnemo").get_attribute("data-state") == "annotating"
+    assert "助记生成中" in rplayer.inner_text("#rmnemo")
+    assert rplayer.locator("#rknow").is_enabled()      # 没被助记卡住
+
+    # 跑一轮离线假 worker，再进来这张卡就有助记正文了
+    stats = run_fake_worker(review_workspace)
+    assert stats["done"] >= 1 and stats["failed"] == 0
+    rplayer.click("#rrefresh")
+    rplayer.wait_for_selector("#rcard[data-state='front']")
+    rplayer.keyboard.press(" ")
+    # 等正文真的到位（只等 data-state=done 会读到"读取助记…"的空壳）
+    rplayer.wait_for_selector("#rmnemo .hook", timeout=15000)
+    assert rplayer.locator("#rmnemo").get_attribute("data-state") == "done"
+    assert GLOSS_PREFIX in rplayer.inner_text("#rmnemo")
+    assert "读取助记" not in rplayer.inner_text("#rmnemo")
+
+
+def test_review_sentence_jumps_back_to_the_episode(rplayer, review_url):
+    card = http_json(review_url, "/review/next")["cards"][0]
+    enc = card["encounter"]
+    assert enc["t_start"] is not None and enc["content_id"] is not None
+
+    open_review(rplayer)
+    rplayer.wait_for_selector("#rcard")
+    assert rplayer.inner_text("#rcard .rsent .smeta .meta").startswith("s01e01")
+    rplayer.click("#rcard .rsent .jump")
+
+    rplayer.wait_for_selector("#view-play.on")
+    rplayer.wait_for_function(
+        "t => Math.abs(document.getElementById('video').currentTime - t) < 0.5",
+        arg=enc["t_start"],
+    )
+    # 跳走不算答题：队列长度没变，切回去卡还在
+    assert http_json(review_url, "/review/stats")["due"] == 1
+    open_review(rplayer)
+    rplayer.wait_for_selector("#rcard")
+    assert rplayer.locator("#rcard").get_attribute("data-lemma") == card["lemma"]
+
+
+def test_review_dont_brings_the_word_back_tomorrow(rplayer, review_workspace, review_url):
+    """答"不会"：今天不再复读，明天回来（stage 归 0，next_due = 明天）。"""
+    open_review(rplayer)
+    rplayer.wait_for_selector("#rcard")
+    entry_id = int(rplayer.locator("#rcard").get_attribute("data-entry"))
+    rplayer.click("#rdont")
+    rplayer.wait_for_selector(".rempty")              # 今天的最后一张答完 → 空态
+
+    assert http_json(review_url, "/review/next")["remaining"] == 0
+    conn = init_db(review_workspace["db"])
+    try:
+        now = review_rules.now_utc()
+        state = next(
+            s for s in review_rules.entry_states(conn, now) if s.id == entry_id
+        )
+        assert state.stage == 0 and state.due is False
+        assert state.next_due == (now + timedelta(days=1)).date().isoformat()
+        tomorrow = [s.id for s in review_rules.due_states(conn, now + timedelta(days=1))]
+        assert entry_id in tomorrow                   # 明天准时回来
+    finally:
+        conn.close()
+
+
+def test_review_empty_state_offers_a_way_back_to_playing(rplayer, review_url):
+    open_review(rplayer)
+    # 把今天剩下的都答掉（上面的用例可能留了尾巴），最多 40 张，防死循环
+    for _ in range(40):
+        if rplayer.locator("#rcard").count() == 0:
+            break
+        rplayer.keyboard.press("j")
+        rplayer.wait_for_timeout(120)
+    rplayer.wait_for_selector(".rempty")
+
+    empty = rplayer.inner_text(".rempty")
+    assert "队列已清空" in empty and "去看剧攒词" in empty
+    assert http_json(review_url, "/review/next")["remaining"] == 0
+
+    rplayer.click("#rtoplay")                          # 一键回播放界面
+    rplayer.wait_for_selector("#view-play.on")
+
+
+def test_review_shows_a_retryable_error_when_the_api_dies(page, review_url):
+    """服务/网络抽风时：一行错误 + 重试按钮，界面不许卡在"载入中"。
+
+    这条用例故意让请求失败，控制台必然有网络报错，所以不用 rplayer 那个
+    "零 JS 报错"的夹具，自己开页面。
+    """
+    page.route("**/review/next*", lambda route: route.abort())
+    page.goto(review_url + "/static/player.html")
+    page.wait_for_selector("#ep option[value]", state="attached")
+    open_review(page)
+
+    page.wait_for_selector("#rerr:not([hidden])")
+    assert "加载失败" in page.inner_text("#rerr")
+    assert page.locator("#rretry").is_visible()
+    assert page.locator("#rcard").count() == 0
+    assert "载入中" not in page.inner_text("#rdeck")   # 不许卡在加载态
+
+    page.unroute("**/review/next*")                   # 服务活过来了
+    page.click("#rretry")
+    page.wait_for_selector("#rerr[hidden]", state="attached")
+    page.wait_for_selector("#rdeck .rempty, #rdeck .rcard")
