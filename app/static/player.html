@@ -235,15 +235,15 @@ body:not([data-view="play"]) #card{display:none}
 .mnemo .wait{color:var(--dim)}
 .mnemo .wait::after{content:""}
 
-/* ---------- 生词本界面（全屏） ---------- */
-#vbar{
+/* ---------- 生词本 / 内容库 界面（全屏） ---------- */
+#vbar, #libbar{
   display:flex; align-items:center; gap:12px; flex-wrap:wrap;
   padding:8px 12px; border:1px solid var(--line); background:var(--panel);
   color:var(--acc); font-size:11px; letter-spacing:.14em; margin-bottom:12px;
 }
-#vbar .cnt{color:var(--dim); letter-spacing:.02em; font-size:12px}
-#vbar .spacer{flex:1}
-#vbar button{letter-spacing:.02em}
+#vbar .cnt, #libbar .cnt{color:var(--dim); letter-spacing:.02em; font-size:12px}
+#vbar .spacer, #libbar .spacer{flex:1}
+#vbar button, #libbar button{letter-spacing:.02em}
 #vlist{
   display:grid; gap:12px;
   grid-template-columns:repeat(auto-fill, minmax(330px, 1fr));
@@ -271,6 +271,67 @@ body:not([data-view="play"]) #card{display:none}
 }
 .vcard .enc .jump:hover{color:var(--acc); border-color:var(--acc)}
 .empty{color:var(--dim); padding:18px 2px; line-height:1.9; white-space:pre-line}
+
+/* ---------- 内容库界面（工单 12） ---------- */
+#liblist{border:1px solid var(--line); background:var(--panel-2)}
+.lrow{
+  display:grid; gap:12px; align-items:center; padding:8px 11px;
+  grid-template-columns:92px minmax(160px,1fr) 72px 84px 96px minmax(120px,1.1fr);
+  border-bottom:1px solid var(--line); cursor:pointer;
+}
+.lrow:last-child{border-bottom:0}
+.lrow:hover{background:rgba(63,240,138,.06)}
+.lrow.head{
+  cursor:default; background:var(--panel); color:var(--dim);
+  font-size:11px; letter-spacing:.14em;
+}
+.lrow.head:hover{background:var(--panel)}
+.lrow .se{color:var(--acc)}
+.lrow .ti{color:var(--white); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.lrow .num, .lrow .dur{color:var(--dim); font-variant-numeric:tabular-nums}
+.lrow .bx{color:var(--dim)}
+.lrow .bx.on{color:var(--acc)}
+.lrow .ms{color:var(--dim); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.lrow .ms.warn{color:var(--amber)}
+.lrow .ms.err{color:#ff5d5d}
+
+/* 导入表单 */
+#impbox{margin-top:18px; border:1px solid var(--line); background:var(--panel)}
+#impbox .imphead{
+  padding:8px 12px; border-bottom:1px solid var(--line);
+  color:var(--acc); font-size:11px; letter-spacing:.14em;
+}
+#impForm{padding:12px 12px 4px}
+.fld{display:flex; align-items:center; gap:10px; margin-bottom:9px; flex-wrap:wrap}
+.fld > label{flex:0 0 172px; color:var(--dim); font-size:12px}
+.fld input[type="text"]{
+  flex:1; min-width:180px; padding:5px 8px; border-radius:2px;
+  background:var(--panel-2); border:1px solid var(--line); color:var(--fg);
+}
+.fld input[type="file"]{flex:1; min-width:200px; color:var(--dim); font-size:12px}
+.fld input[type="file"]::file-selector-button{
+  font:inherit; margin-right:8px; padding:4px 9px; cursor:pointer; border-radius:2px;
+  background:var(--panel-2); border:1px solid var(--line); color:var(--fg);
+}
+.fld .hint{color:var(--dim); font-size:11px; flex-basis:100%; padding-left:182px}
+.impfoot{display:flex; align-items:center; gap:12px; margin:12px 0 4px}
+#impBtn{border-color:var(--acc); color:var(--acc)}
+#impBtn:hover:not(:disabled){background:rgba(63,240,138,.12)}
+#impMsg{color:var(--dim); font-size:12px}
+#impMsg.err{color:#ff5d5d}
+#impMsg.ok{color:var(--acc)}
+#impProg{padding:2px 12px 12px}
+#impProg[data-state="idle"]{display:none}
+.pstage{display:flex; align-items:center; gap:10px; margin-top:7px; font-size:12px; color:var(--dim)}
+.pstage .pl{flex:0 0 96px}
+.pstage .pbar{flex:1; height:7px; border:1px solid var(--line); background:var(--panel-2)}
+.pstage .pbar i{display:block; height:100%; width:0; background:var(--acc); transition:width .12s linear}
+.pstage .pv{flex:0 0 132px; text-align:right; font-variant-numeric:tabular-nums}
+.pstage[data-state="run"] .pl, .pstage[data-state="done"] .pl{color:var(--fg)}
+.pstage[data-state="done"] .pv{color:var(--acc)}
+.pstage[data-state="err"] .pl, .pstage[data-state="err"] .pv{color:#ff5d5d}
+.pstage[data-state="err"] .pbar i{background:#ff5d5d}
+#impWarn{color:var(--amber); font-size:12px; margin-top:9px; white-space:pre-line}
 </style>
 </head>
 <body data-view="play">
@@ -314,6 +375,64 @@ body:not([data-view="play"]) #card{display:none}
     </div>
 
     <div id="segline"><span class="k">当前段</span> <b id="segtext">—</b></div>
+  </section>
+
+  <section class="view" id="view-lib">
+    <div id="libbar">
+      <span>■ LIBRARY // 内容库</span>
+      <span class="cnt" id="libcount">—</span>
+      <div class="spacer"></div>
+      <button id="librefresh" title="重新拉取内容库">刷新</button>
+    </div>
+    <div id="liblist"></div>
+
+    <div id="impbox">
+      <div class="imphead">■ IMPORT // 导入剧集</div>
+      <form id="impForm" autocomplete="off">
+        <div class="fld">
+          <label for="impTitle">剧名</label>
+          <input type="text" id="impTitle" placeholder="Person of Interest" required>
+        </div>
+        <div class="fld">
+          <label for="impSeasonEp">季 / 集编号</label>
+          <input type="text" id="impSeasonEp" placeholder="s01e01" required>
+        </div>
+        <div class="fld">
+          <label for="impVideo">视频文件</label>
+          <input type="file" id="impVideo" accept="video/*,.mkv,.mp4,.webm,.avi,.ts,.m4v" required>
+        </div>
+        <div class="fld">
+          <label for="impAudio">音频文件（可选）</label>
+          <input type="file" id="impAudio" accept="audio/*,.m4a,.aac,.mp3,.ac3,.flac,.opus,.ogg">
+          <span class="hint">音视频分离的片源才需要；给了就先校验两条流的时长，再无损合并画面。</span>
+        </div>
+        <div class="fld">
+          <label for="impSrt">英文 SRT</label>
+          <input type="file" id="impSrt" accept=".srt,text/plain" required>
+        </div>
+        <div class="fld">
+          <label for="impBoxes">词框 boxes.json（可选）</label>
+          <input type="file" id="impBoxes" accept=".json,application/json">
+          <span class="hint">extract_hardsub.py --boxes-json 的产物；没有就走自渲染退路。</span>
+        </div>
+        <div class="impfoot">
+          <button type="submit" id="impBtn">开始导入</button>
+          <span id="impMsg"></span>
+        </div>
+      </form>
+      <div id="impProg" data-state="idle">
+        <div class="pstage" id="stUpload" data-state="idle">
+          <span class="pl">① 上传</span><span class="pbar"><i></i></span><span class="pv">—</span>
+        </div>
+        <div class="pstage" id="stMerge" data-state="idle">
+          <span class="pl">② 校验/合并</span><span class="pbar"><i></i></span><span class="pv">—</span>
+        </div>
+        <div class="pstage" id="stIngest" data-state="idle">
+          <span class="pl">③ 入库</span><span class="pbar"><i></i></span><span class="pv">—</span>
+        </div>
+        <div id="impWarn"></div>
+      </div>
+    </div>
   </section>
 
   <section class="view" id="view-vocab">
@@ -370,12 +489,19 @@ var CONF = {
   MNEMO: {
     POLL_MS: 2000,   // 查询卡打开期间的轮询间隔
     MAX_MS: 30000    // 最多轮询这么久，之后停手（生词本界面手动刷新）
+  },
+
+  /* 导入剧集的作业轮询（工单 12：合并/入库在服务端后台线程里跑） */
+  IMPORT: {
+    POLL_MS: 500,
+    MAX_MS: 6 * 3600 * 1000   // 一集正片合并可能几十分钟，上限给足
   }
 };
 
 /* 界面清单：加一个界面就在这儿加一行（id / 标签 / 进入时的钩子） */
 var VIEWS = [
   { id: "play",  label: "播放" },
+  { id: "lib",   label: "内容库", enter: function(){ loadLibrary(); } },
   { id: "vocab", label: "生词本", enter: function(){ loadVocab(); } }
 ];
 
@@ -448,7 +574,9 @@ var S = {
   maskDirty: true,       // 有新帧/新几何待处理（只认新帧上屏，不认 currentTime）
   mnemoTimer: null,      // 查询卡的助记轮询
   mnemoLexeme: null,
-  vocabToken: 0          // 生词本重载令牌（防止旧请求写进新界面）
+  vocabToken: 0,         // 生词本重载令牌（防止旧请求写进新界面）
+  libToken: 0,           // 内容库重载令牌（同上）
+  importing: false       // 正在导入（期间禁掉表单，别并发两条流水线）
 };
 
 var video = $("video");
@@ -1173,6 +1301,215 @@ async function jumpTo(contentId, t){
   }
 }
 
+/* ========== 内容库界面（工单 12：浏览已导入的集 + 导入新集） ========== */
+function fmtDur(sec){
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  var mm = (m < 10 ? "0" : "") + m, ss = (s < 10 ? "0" : "") + s;
+  return h ? h + ":" + mm + ":" + ss : mm + ":" + ss;
+}
+function fmtSize(n){
+  n = Number(n) || 0;
+  if (n <= 0) return "—";
+  var u = ["B", "KB", "MB", "GB", "TB"], i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 || n >= 10 ? Math.round(n) : n.toFixed(1)) + u[i];
+}
+
+/* 媒体状态一栏：文件在不在 / 有没有音轨。
+   has_audio 是导入时 ffprobe 登记的，CLI ingest 进来的老数据是 null（不下结论）。*/
+function mediaState(e){
+  if (!e.media_name) return { cls: "err", text: "未登记媒体" };
+  if (e.media_missing) return { cls: "err", text: "✕ 文件丢失" };
+  if (!e.has_video) return { cls: "err", text: "✕ 读不到" };
+  if (e.has_audio === false) return { cls: "warn", text: "⚠ 无音轨 · " + fmtSize(e.media_size) };
+  return { cls: "", text: "✓ " + fmtSize(e.media_size) };
+}
+
+async function loadLibrary(){
+  var host = $("liblist"), token = ++S.libToken;
+  var d;
+  try {
+    d = await api("/episodes");
+  } catch (e) {
+    if (token !== S.libToken) return;
+    clear(host);
+    $("libcount").textContent = "—";
+    host.appendChild(el("div", "empty", "内容库加载失败：" + (e.message || e)));
+    return;
+  }
+  if (token !== S.libToken) return;
+  S.episodes = d.episodes || [];
+  clear(host);
+  $("libcount").textContent = S.episodes.length ? S.episodes.length + " 集" : "空";
+  if (!S.episodes.length) {
+    host.appendChild(el("div", "empty",
+      "内容库还是空的。\n用下面的「导入剧集」表单加一集（或者命令行跑 python -m app.ingest）。"));
+    return;
+  }
+  host.appendChild(libRow(null));
+  S.episodes.forEach(function(e){ host.appendChild(libRow(e)); });
+}
+
+var LIB_COLS = ["se", "ti", "num", "dur", "bx", "ms"];
+var LIB_HEAD = ["季/集", "标题", "段数", "时长", "词框", "媒体"];
+
+function libRow(e){
+  var r = el("div", "lrow");
+  if (e === null) {
+    r.className = "lrow head";
+    LIB_HEAD.forEach(function(t, i){ r.appendChild(el("span", LIB_COLS[i], t)); });
+    return r;
+  }
+  r.dataset.contentId = String(e.id);
+  r.title = "点这行 → 切到播放界面并选中这一集";
+  r.appendChild(el("span", "se", e.season_ep));
+  r.appendChild(el("span", "ti", e.title));
+  r.appendChild(el("span", "num", e.segments + " 段"));
+  r.appendChild(el("span", "dur", fmtDur(e.duration)));
+  r.appendChild(el("span", "bx" + (e.has_boxes ? " on" : ""),
+                    e.has_boxes ? "✓ " + e.boxes_segments + " 段" : "—"));
+  var st = mediaState(e);
+  var ms = el("span", "ms" + (st.cls ? " " + st.cls : ""), st.text);
+  if (e.warnings && e.warnings.length) ms.title = e.warnings.join("\n");
+  r.appendChild(ms);
+  r.addEventListener("click", function(){ openEpisode(e.id); });
+  return r;
+}
+
+/* 内容库点一行 → 播放界面并选中该集 */
+async function openEpisode(id){
+  setView("play");
+  try {
+    var sel = $("ep");
+    sel.value = String(id);
+    if (sel.value !== String(id)) {   // 下拉里还没有这集（刚导入/被别处改过）
+      await loadEpisodes(id);
+      return;
+    }
+    if (Number(id) !== Number(S.contentId)) await loadEpisode(id);
+  } catch (e) {
+    setStatus("加载失败：" + (e.message || e), "err");
+  }
+}
+
+/* ---- 导入：上传（XHR 进度）→ 轮询合并/入库阶段 ---- */
+function setStage(id, state, pct, text){
+  var n = $(id);
+  n.dataset.state = state;
+  n.querySelector(".pbar i").style.width = Math.round(clamp(pct, 0, 1) * 100) + "%";
+  n.querySelector(".pv").textContent = text;
+}
+function resetStages(){
+  ["stUpload", "stMerge", "stIngest"].forEach(function(id){ setStage(id, "idle", 0, "—"); });
+  $("impWarn").textContent = "";
+}
+function failRunningStages(msg){
+  ["stUpload", "stMerge", "stIngest"].forEach(function(id){
+    if ($(id).dataset.state === "run") setStage(id, "err", 1, msg);
+  });
+}
+
+/* 上传进度只有 XMLHttpRequest 给得了：fetch 要报上传进度得把 body 换成
+   ReadableStream（仅 Chrome + HTTP/2 且要 duplex:"half"），本地播放器不值当。
+   合并/入库在服务端后台线程里跑，进度靠轮询 GET /import/{job_id}。*/
+function uploadImport(fd, onProgress){
+  return new Promise(function(resolve, reject){
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/import");
+    xhr.upload.addEventListener("progress", function(ev){
+      if (ev.lengthComputable) onProgress(ev.loaded / ev.total, ev.loaded, ev.total);
+    });
+    xhr.addEventListener("load", function(){
+      var body = null;
+      try { body = JSON.parse(xhr.responseText); } catch (e) { body = null; }
+      if (xhr.status >= 200 && xhr.status < 300 && body && body.job_id) resolve(body);
+      else reject(new Error(body && body.detail ? body.detail : "HTTP " + xhr.status));
+    });
+    xhr.addEventListener("error", function(){ reject(new Error("上传中断（服务断了？）")); });
+    xhr.addEventListener("abort", function(){ reject(new Error("上传已取消")); });
+    xhr.send(fd);
+  });
+}
+
+function paintImportJob(j){
+  if (j.stage === "probing") setStage("stMerge", "run", 0.06, "校验媒体…");
+  else if (j.stage === "merging")
+    setStage("stMerge", "run", Math.max(0.06, j.progress),
+             Math.round(j.progress * 100) + "% 合并中");
+  else if (j.stage === "ingesting") {
+    setStage("stMerge", "done", 1, "OK");
+    setStage("stIngest", "run", 0.5, "字幕入库…");
+  }
+  if (j.warnings && j.warnings.length) $("impWarn").textContent = "⚠ " + j.warnings.join("\n⚠ ");
+}
+
+function pollImport(jobId){
+  return new Promise(function(resolve, reject){
+    var t0 = Date.now();
+    (function tick(){
+      api("/import/" + encodeURIComponent(jobId)).then(function(j){
+        paintImportJob(j);
+        if (j.stage === "done") return resolve(j);
+        if (j.stage === "error") return reject(new Error(j.error || "导入失败"));
+        if (Date.now() - t0 > CONF.IMPORT.MAX_MS) return reject(new Error("导入超时，去看服务端日志"));
+        setTimeout(tick, CONF.IMPORT.POLL_MS);
+      }).catch(reject);
+    })();
+  });
+}
+
+async function runImport(){
+  if (S.importing) return;
+  var msg = $("impMsg");
+  var title = $("impTitle").value.trim(), seasonEp = $("impSeasonEp").value.trim();
+  var video = $("impVideo").files[0], srt = $("impSrt").files[0];
+  var audio = $("impAudio").files[0], boxes = $("impBoxes").files[0];
+  msg.className = "";
+  if (!title || !seasonEp) { msg.className = "err"; msg.textContent = "剧名和季/集编号都要填"; return; }
+  if (!video || !srt) { msg.className = "err"; msg.textContent = "视频文件和英文 SRT 都要选"; return; }
+
+  var fd = new FormData();
+  fd.append("title", title);
+  fd.append("season_ep", seasonEp);
+  fd.append("video", video, video.name);
+  fd.append("srt", srt, srt.name);
+  if (audio) fd.append("audio", audio, audio.name);
+  if (boxes) fd.append("boxes", boxes, boxes.name);
+  var total = video.size + srt.size + (audio ? audio.size : 0) + (boxes ? boxes.size : 0);
+
+  S.importing = true;
+  $("impBtn").disabled = true;
+  $("impProg").dataset.state = "run";
+  resetStages();
+  msg.textContent = "导入中…（这个页面别关）";
+  setStage("stUpload", "run", 0, "0% / " + fmtSize(total));
+  try {
+    var started = await uploadImport(fd, function(p){
+      setStage("stUpload", "run", p, Math.round(p * 100) + "% / " + fmtSize(total));
+    });
+    setStage("stUpload", "done", 1, fmtSize(total) + " 已上传");
+    setStage("stMerge", "run", 0.06, "校验媒体…");
+    var job = await pollImport(started.job_id);
+    setStage("stMerge", "done", 1, "OK");
+    setStage("stIngest", "done", 1,
+             (job.stats && job.stats.segments != null) ? job.stats.segments + " 段" : "OK");
+    msg.className = "ok";
+    msg.textContent = "导入完成：" + title + " " + seasonEp + "（content_id=" + job.content_id + "）";
+    $("impForm").reset();
+    await loadLibrary();
+    await loadEpisodes(job.content_id);   // 刷新选集下拉并选中新集
+    setView("play");                      // 导完直接开看（验收 §7）
+  } catch (e) {
+    failRunningStages("失败");
+    msg.className = "err";
+    msg.textContent = "导入失败：" + (e.message || e);
+  } finally {
+    S.importing = false;
+    $("impBtn").disabled = false;
+  }
+}
+
 /* ========== 界面切换 ========== */
 function buildTabs(){
   var host = $("tabs");
@@ -1220,15 +1557,16 @@ function cycleView(){
 }
 
 /* ========== 加载数据 ========== */
-async function loadEpisodes(){
+/* preferId：导入完成后要求落在指定的那一集（验收 §7 自动切换） */
+async function loadEpisodes(preferId){
   setStatus("拉取集列表…");
   var d = await api("/episodes");
   S.episodes = d.episodes || [];
   var sel = $("ep");
   clear(sel);
   if (!S.episodes.length) {
-    sel.appendChild(el("option", null, "（库里没有内容，先跑 app.ingest）"));
-    setStatus("库里没有已入库的集数：python -m app.ingest <srt> --title … --season-ep …", "warn");
+    sel.appendChild(el("option", null, "（库里没有内容，去「内容库」界面导入一集）"));
+    setStatus("库里还没有内容：切到「内容库」界面导入，或命令行跑 python -m app.ingest", "warn");
     return;
   }
   S.episodes.forEach(function(e){
@@ -1237,9 +1575,12 @@ async function loadEpisodes(){
     o.value = String(e.id);
     sel.appendChild(o);
   });
-  var first = S.episodes.filter(function(e){ return e.has_video; })[0] || S.episodes[0];
-  sel.value = String(first.id);
-  await loadEpisode(first.id);
+  var want = preferId == null ? null : S.episodes.filter(function(e){
+    return Number(e.id) === Number(preferId);
+  })[0];
+  var pick = want || S.episodes.filter(function(e){ return e.has_video; })[0] || S.episodes[0];
+  sel.value = String(pick.id);
+  await loadEpisode(pick.id);
 }
 
 async function loadEpisode(id){
@@ -1289,6 +1630,8 @@ $("ep").addEventListener("change", function(){
 });
 $("pauseChk").addEventListener("change", function(){ S.pauseOnClick = $("pauseChk").checked; });
 $("vrefresh").addEventListener("click", function(){ loadVocab(); });
+$("librefresh").addEventListener("click", function(){ loadLibrary(); });
+$("impForm").addEventListener("submit", function(ev){ ev.preventDefault(); runImport(); });
 $("cardX").addEventListener("click", function(ev){ ev.stopPropagation(); closeCard(); });
 
 $("playBtn").addEventListener("click", togglePlay);
