@@ -119,6 +119,11 @@ id = AnnotationJob.id，批量对位的唯一依据）：
   重复 id 的元素一律丢弃，对应任务下一轮只重试没对上的那些。
 - **预热 = 预算制**：ingest 完成时把 当集 lemma ∩ cet46.txt 按词频降序入队（低优先级），
   每集预算上限默认 ¥4（配置项），估算超限即截断。点击收藏的词永远高优先级插队。
+- **估价 fail closed**（v0.4）：estimate_cost 异常或返回非法值 → 本轮停手，任务保持
+  queued，高优先级同样停——成本不明时一分钱不花；独立退出码与计数器，与预算耗尽区分。
+- provider 现实（v0.4）：DeepSeek 默认 deepseek-v4-flash，请求体显式
+  `"thinking":{"type":"disabled"}`（官方默认开启 thinking 且 effort=high）；估价一律按
+  峰时+cache-miss 的保守上界计。
   预算检查与费用累计发生在**每一次真实 provider 调用之前**（重试也计费，
   否则一批重试 3 次就能把 ¥4 烧成 ¥12，工单 6-1）；高优先级不受限但费用照记。
 

@@ -58,7 +58,7 @@ python -m uvicorn app.server:app --port 8000
 # 先用假 provider 看流程（不花钱）
 python -m app.annotate --db data/poi.db --provider fake --once
 
-# 接真模型：塞 key 即切（DeepSeek 约 ¥0.0035/词）
+# 接真模型：塞 key 即切（DeepSeek deepseek-v4-flash，约 ¥0.004/词，按峰时价保守估）
 set DEEPSEEK_API_KEY=sk-...        # PowerShell: $env:DEEPSEEK_API_KEY="sk-..."
 python -m app.annotate --db data/poi.db --provider deepseek --once --budget 4
 
