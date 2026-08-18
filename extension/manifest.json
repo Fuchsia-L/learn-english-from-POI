@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "POI 划词收词",
+  "version": "0.1.0",
+  "description": "任意网页选中英文词 → 查本地词典 → 收进 learn-english-from-POI 生词本（全程只连 127.0.0.1）。",
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "background": {
+    "service_worker": "bg.js",
+    "scripts": ["bg.js"]
+  },
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "web_accessible_resources": [
+    {
+      "resources": ["styles.css"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "poi-word-collector@localhost",
+      "strict_min_version": "121.0"
+    }
+  }
+}

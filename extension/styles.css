@@ -1,0 +1,137 @@
+/* POI 划词收词 —— 浮标与查询卡的样式。
+
+   与 app/static/player.html 同族：近黑底、等宽字、终端绿强调、四角括号。
+   全部挂在 Shadow DOM 里，所以既不会被页面 CSS 改掉，也不会污染页面。 */
+
+:host,
+.poi-root {
+  --poi-bg: #080d13;
+  --poi-panel: #0c131b;
+  --poi-line: #1a2733;
+  --poi-fg: #c3d2dd;
+  --poi-dim: #61758a;
+  --poi-acc: #3ff08a;   /* 终端绿 */
+  --poi-amber: #ffb454; /* 琥珀 */
+  --poi-white: #e9f2f7;
+  --poi-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+              "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+}
+
+.poi-root {
+  font: 13px/1.5 var(--poi-mono);
+  letter-spacing: .02em;
+  color: var(--poi-fg);
+}
+
+.poi-root * {
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+/* ---------- ⌖ 浮标 ---------- */
+.poi-flag {
+  display: block;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  line-height: 22px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--poi-acc);
+  background: var(--poi-bg);
+  border: 1px solid var(--poi-line);
+  border-radius: 2px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .6);
+  cursor: pointer;
+  opacity: .92;
+}
+.poi-flag:hover {
+  color: var(--poi-white);
+  border-color: var(--poi-acc);
+  opacity: 1;
+}
+
+/* ---------- 查询卡 ---------- */
+.poi-card {
+  position: relative;
+  width: min(360px, 88vw);
+  max-height: 70vh;
+  overflow: auto;
+  background: var(--poi-bg);
+  border: 1px solid var(--poi-line);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .65);
+}
+/* POI 监视框：四角括号（player.html 同款） */
+.poi-card::before,
+.poi-card::after {
+  content: "";
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--poi-white);
+  opacity: .7;
+  pointer-events: none;
+}
+.poi-card::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+.poi-card::after { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+
+.poi-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--poi-line);
+  background: linear-gradient(to right, rgba(63, 240, 138, .10), rgba(0, 0, 0, 0));
+  font-size: 11px;
+  letter-spacing: .14em;
+  color: var(--poi-acc);
+}
+.poi-x {
+  margin-left: auto;
+  color: var(--poi-dim);
+  cursor: pointer;
+  letter-spacing: 0;
+}
+.poi-x:hover { color: var(--poi-white); }
+
+.poi-body { padding: 11px 13px 13px; }
+.poi-row { display: flex; gap: 10px; margin-bottom: 7px; }
+.poi-lb { color: var(--poi-dim); flex: 0 0 58px; font-size: 12px; }
+.poi-vl { flex: 1; word-break: break-word; }
+.poi-surface { color: var(--poi-white); font-size: 18px; letter-spacing: .03em; }
+.poi-lemma { color: var(--poi-acc); font-size: 15px; }
+.poi-ipa { color: var(--poi-amber); }
+.poi-gloss div { margin-bottom: 2px; }
+.poi-dim { color: var(--poi-dim); }
+
+.poi-sent {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border-left: 2px solid var(--poi-line);
+  background: var(--poi-panel);
+  color: var(--poi-dim);
+  line-height: 1.7;
+  max-height: 8.5em;
+  overflow: auto;
+}
+
+.poi-note { color: var(--poi-amber); margin-top: 8px; font-size: 12px; line-height: 1.6; }
+
+.poi-foot { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.poi-btn {
+  background: var(--poi-panel);
+  border: 1px solid var(--poi-acc);
+  color: var(--poi-acc);
+  padding: 5px 10px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.poi-btn:hover { background: rgba(63, 240, 138, .12); }
+.poi-btn.done,
+.poi-btn:disabled {
+  border-color: var(--poi-line);
+  color: var(--poi-dim);
+  background: transparent;
+  cursor: default;
+}
+.poi-msg { color: var(--poi-acc); font-size: 12px; }

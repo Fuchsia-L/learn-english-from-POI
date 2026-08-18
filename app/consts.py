@@ -11,6 +11,11 @@ DEFAULT_DB = "data/poi.db"
 DEFAULT_ECDICT = "data/ecdict.db"
 DEFAULT_WORDLIST = "data/cet46.txt"
 
+# --- annotate 输入包的 episode 字段（工单 11） ------------------------------
+# 网页划词收藏的词没有"集数"，但 episode 是输入契约里的字段（DESIGN §5）。
+# 填 "web" 比填 null 有信息量：模型据此知道这句不是台词，是网页上的句子。
+WEB_EPISODE = "web"
+
 # --- AnnotationJob 优先级（DESIGN §5 预算制） -------------------------------
 # 用户点击收藏触发的助记任务：永远插队，不受预算限制（花费仍然记账）
 COLLECT_JOB_PRIORITY = 10
