@@ -29,8 +29,11 @@ class AnthropicProvider(ChatJSONProvider):
     endpoint = "https://api.anthropic.com/v1/messages"
     model = DEFAULT_MODEL
 
-    # 牌价换算成人民币（按 $1/M in、$5/M out × 汇率 7.2 的量级粗估）。
-    # **随时可能过期**——真要看钱包请自己核对官网价目表后改这两个数。
+    # 牌价（人民币元 / 百万 token）。**来源和 deepseek.py 那份不一样，别混**：
+    # Anthropic 官网只标美元，这两个数是 claude-haiku 档 $1/M 输入、$5/M 输出
+    # 按汇率 ≈7.2 折出来的**量级粗估**，不是官方人民币牌价，也没核过 2026-08 现价。
+    # 主力 provider 是 DeepSeek，Anthropic 只做糙跑备份，故本轮只补来源不动数值。
+    # **随时可能过期**——真要拿它花钱，先核对官网价目表再改这两行。
     price_in_cny_per_mtok = 7.2
     price_out_cny_per_mtok = 36.0
 

@@ -28,25 +28,33 @@ from app.providers.prompts import build_messages
 
 DEFAULT_MODEL = "deepseek-v4-flash"
 
-# --- 牌价 ------------------------------------------------------------------
-# **官方美元价 2026-08 摘录**（官网只标美元，分峰谷两档；下面单位都是
-# 美元 / 百万 token）。峰时 = 01:00–04:00 与 06:00–10:00 UTC，谷时半价。
+# --- 牌价（**官方牌价 2026-08，变价改这里**）--------------------------------
+# deepseek-v4-flash 的官网人民币价目，单位都是 **元 / 百万 token**。官网直接标
+# 人民币，所以这里不再走"美元 × 汇率"那一道（少一个会漂的估计量）。
+#
+#   峰时（保守上界，**估价只认这两个数**）：
+#       输入 cache-miss  ¥3.00     输出  ¥9.00
+#   下面这些只作记录，**不参与估算**：
+#       错峰：峰价减半（输入 cache-miss ¥1.50 / 输出 ¥4.50）
+#       缓存命中：¥0.10（错峰再减半 ¥0.05）
+#
+# 峰时 = **北京时间 09:00–12:00 与 14:00–18:00**，其余时段按错峰计。
 # 随时可能过期，接真 key 之前自己去官网核对一遍。
-USD_PER_MTOK_IN_MISS_PEAK = 0.44    # 输入 cache-miss，峰时
-USD_PER_MTOK_IN_MISS_OFF = 0.22     # 输入 cache-miss，谷时
-USD_PER_MTOK_IN_HIT_PEAK = 0.014    # 输入 cache-hit，峰时
-USD_PER_MTOK_IN_HIT_OFF = 0.007     # 输入 cache-hit，谷时
-USD_PER_MTOK_OUT_PEAK = 1.32        # 输出，峰时
-USD_PER_MTOK_OUT_OFF = 0.66         # 输出，谷时
+PRICE_IN_MISS_PEAK_CNY_PER_MTOK = 3.0     # 输入 cache-miss，峰时 —— 估价用
+PRICE_OUT_PEAK_CNY_PER_MTOK = 9.0         # 输出，峰时 —— 估价用
+# 以下四个常量仅供查阅/对账，估价一律不用（见下面的口径说明）
+PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK = 1.5  # 输入 cache-miss，错峰（峰价减半）
+PRICE_IN_HIT_PEAK_CNY_PER_MTOK = 0.10     # 输入 cache-hit，峰时
+PRICE_IN_HIT_OFFPEAK_CNY_PER_MTOK = 0.05  # 输入 cache-hit，错峰
+PRICE_OUT_OFFPEAK_CNY_PER_MTOK = 4.5      # 输出，错峰（峰价减半）
 
-# 汇率：近似值，**自己查当日中间价再改**。估价只用来卡预算，差几个点不影响结论，
-# 但别指望它能对账。
-USD_CNY = 7.2
+# 峰时窗口（北京时间），只用于文档/日志说明，不参与计算。
+PEAK_HOURS_BEIJING = ((9, 12), (14, 18))
 
 # 估价口径（硬规矩）：一律按 **峰时 + cache-miss** 算，即牌价里最贵的那一档。
-# 预算是硬顶不是期望值——谷时/命中缓存省下来的钱算意外之喜，不许提前花掉。
-PRICE_IN_CNY_PER_MTOK = USD_PER_MTOK_IN_MISS_PEAK * USD_CNY   # 3.168
-PRICE_OUT_CNY_PER_MTOK = USD_PER_MTOK_OUT_PEAK * USD_CNY      # 9.504
+# 预算是硬顶不是期望值——错峰/命中缓存省下来的钱算意外之喜，不许提前花掉。
+PRICE_IN_CNY_PER_MTOK = PRICE_IN_MISS_PEAK_CNY_PER_MTOK
+PRICE_OUT_CNY_PER_MTOK = PRICE_OUT_PEAK_CNY_PER_MTOK
 
 # 每个词条预留的输出 token（保守上界）。依据：
 #   - context_gloss 模板要求 20~40 个汉字，按上界 40 ≈ 40 token；
@@ -64,7 +72,7 @@ class DeepSeekProvider(ChatJSONProvider):
     endpoint = "https://api.deepseek.com/chat/completions"
     model = DEFAULT_MODEL
 
-    # 牌价换算成人民币元 / 百万 token（基类的估价公式用这两个）。
+    # 官方人民币牌价，元 / 百万 token（基类的估价公式只认这两个；峰时 cache-miss）。
     price_in_cny_per_mtok = PRICE_IN_CNY_PER_MTOK
     price_out_cny_per_mtok = PRICE_OUT_CNY_PER_MTOK
     out_tokens_per_item = OUT_TOKENS_PER_ITEM
