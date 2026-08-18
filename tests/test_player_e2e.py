@@ -444,8 +444,7 @@ def test_collect_then_word_shows_up_in_vocab_view(player, server_url):
     )
     assert player.locator("#collectBtn").is_disabled()
 
-    player.keyboard.press("v")                    # 快捷键切界面（不再是侧栏）
-    player.wait_for_selector("#view-vocab.on")
+    set_view(player, "vocab")                     # 切界面（不再是侧栏）
     player.wait_for_selector("#vlist .vcard")
     grid = player.inner_text("#vlist")
     assert "cop" in grid
@@ -461,8 +460,7 @@ def test_collect_then_word_shows_up_in_vocab_view(player, server_url):
     entry = next(v for v in data["vocab"] if v["lemma"] == "cop")
     assert entry["encounters"][0]["sentence"] == SEG_TEXT[1]
 
-    player.keyboard.press("v")
-    player.wait_for_selector("#view-play.on")
+    set_view(player, "play")
 
 
 def test_segment_without_boxes_falls_back_to_self_rendered_line(player):
@@ -552,9 +550,10 @@ def test_click_outside_card_closes_it(player):
 def test_view_tabs_switch_and_video_state_is_restored(player):
     """播放是主界面，生词本是另一个界面；切走暂停、切回恢复原状态。"""
     tabs = player.eval_on_selector_all("#tabs button", "bs => bs.map(b => b.textContent)")
-    assert tabs == ["[ 播放 ]", "[ 生词本 ]"]
+    assert tabs == ["[ 播放 ]", "[ 内容库 ]", "[ 生词本 ]"]    # 内容库见工单 12
     assert player.locator("#view-play").is_visible()
     assert player.locator("#view-vocab").is_hidden()
+    assert player.locator("#view-lib").is_hidden()
 
     goto_segment(player, 1)
     player.evaluate("document.getElementById('video').play()")
@@ -572,9 +571,11 @@ def test_view_tabs_switch_and_video_state_is_restored(player):
     player.wait_for_function("() => !document.getElementById('video').paused")
 
     player.evaluate("document.getElementById('video').pause()")
-    player.keyboard.press("v")
+    player.keyboard.press("v")                      # v 是循环切换：播放 → 内容库
+    player.wait_for_selector("#view-lib.on")
+    player.keyboard.press("v")                      # → 生词本
     player.wait_for_selector("#view-vocab.on")
-    player.keyboard.press("v")
+    player.keyboard.press("v")                      # → 转回播放
     player.wait_for_selector("#view-play.on")
     # 切走前是暂停的，切回来就不许自己播起来
     assert player.evaluate("document.getElementById('video').paused") is True
