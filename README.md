@@ -10,7 +10,7 @@
 - [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 多界面（播放 / 内容库 / 生词本 / 复习）+ 字幕三档 + 忽略白色的自然模糊遮罩 + OCR 词框热区 + 查询卡 + 助记展示
 - [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
 - [x] 预热词表 (`scripts/build_cet46.py`) — CET4+CET6 大纲词表 → `data/cet46.txt`（lemma 归一、去重）
-- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 间隔重复简化版（1/3/7 天、答对 3 次毕业、答错归零）+ 会/不会、纯 SQLite、不碰 LLM
+- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 间隔重复简化版（1/3/7 天、答对 3 次毕业、答错归零）+ 会/不会，纯 SQLite、不碰 LLM
 - [x] 浏览器划词插件 (`extension/`) — 任意网页选中英文词 → ⌖ 浮标 → 终端风查询卡 → 收进同一个生词本（`POST /collect/web`，encounter 记 URL + 整句）
 - [x] 复习界面 (`app/static/player.html` 第四个界面) — 翻卡（正面遮住例句里的目标词）+ `J` 会 / `K` 不会 + 逾期与档位分布 + 一键跳回原句
 
