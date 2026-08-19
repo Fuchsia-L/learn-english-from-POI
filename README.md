@@ -7,12 +7,12 @@
 - [x] 硬字幕 OCR 提取 (`scripts/extract_hardsub.py`) — 已在 2 分钟 1080p 片段上验证,词级准确率 ~99.7%,全程本地零成本
 - [x] 字幕解析 / 分词 / 词元归一 (`app/ingest.py` + `app/db.py`) — srt → SQLite，token 小写归一、simplemma 词元、不排专名
 - [x] 本地词典 (`scripts/build_ecdict.py`) — ECDICT 77 万词条 → `data/ecdict.db`（音标/中文释义/考试标签/词形变换）
-- [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 多界面（播放 / 生词本）+ 字幕三档 + 忽略白色的自然模糊遮罩 + OCR 词框热区 + 查询卡 + 助记展示
+- [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 多界面（播放 / 内容库 / 生词本 / 复习）+ 字幕三档 + 忽略白色的自然模糊遮罩 + OCR 词框热区 + 查询卡 + 助记展示
 - [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
 - [x] 预热词表 (`scripts/build_cet46.py`) — CET4+CET6 大纲词表 → `data/cet46.txt`（lemma 归一、去重）
-- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 最近 7 天滚动 + 会/不会 + 毕业规则，纯 SQLite、不碰 LLM
+- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 间隔重复简化版（1/3/7 天、答对 3 次毕业、答错归零）+ 会/不会、纯 SQLite、不碰 LLM
 - [x] 浏览器划词插件 (`extension/`) — 任意网页选中英文词 → ⌖ 浮标 → 终端风查询卡 → 收进同一个生词本（`POST /collect/web`，encounter 记 URL + 整句）
-- [ ] 复习界面（播放器的第三个 tab；后端接口已就绪，UI 还没接）
+- [x] 复习界面 (`app/static/player.html` 第四个界面) — 翻卡（正面遮住例句里的目标词）+ `J` 会 / `K` 不会 + 逾期与档位分布 + 一键跳回原句
 
 核心原则:LLM 只产语义,代码管装配和钱;词元(lexeme)为主键,encounter 记录每次真实语境;按需生产,看到哪集造到哪集。
 
@@ -60,7 +60,7 @@ ECDICT 的查询/回填口径住在 `app/ecdict.py`，`app/server.py` 和 `app/a
 同一份实现——worker 不 import web 层（`import app.annotate` 不会拖进 fastapi），
 跨模块共享常量（默认路径、任务优先级）在 `app/consts.py`。
 
-### 复习接口（M1 后端，UI 还没接）
+### 复习接口（M1；界面是播放器的第四个 tab「复习」）
 
 ```bash
 curl 'http://127.0.0.1:8000/review/next?limit=20'
@@ -72,11 +72,15 @@ curl http://127.0.0.1:8000/review/stats
 
 规则全写在 `app/review.py` 的常量里（改规则只改常量，接口会把 `rules` 一起吐出来）：
 
-- **进队**：未毕业 且 今天（UTC 日）还没复习过 且（`added_at` 在最近
-  `REVIEW_WINDOW_DAYS = 7` 天内 **或** 历史上答过一次 `dont`）——错过的词一直跟着你。
-- **排序**：从未复习过的最优先，其次上次复习时间最早的优先（同档按收藏早、id 小）。
-- **毕业**：末尾连续 `GRADUATE_STREAK = 2` 次 `know`，且**最后一次复习**距首次收藏
-  ≥ `GRADUATE_MIN_AGE_DAYS = 3` 天。当天收藏当天连点两次不算毕业。
+- **档位（stage）**：不建列，由 `Review` 事件流按时间重放推导——`know` 进一档（封顶），
+  `dont` 归零。改规则不用迁库，历史自动按新规则重推。
+- **间隔**：`INTERVALS = (1, 3, 7)` 天——答对后 `next_due` = 最后一次复习那天 +
+  `INTERVALS[stage-1]`；答 `dont` 按 `DONT_INTERVAL_DAYS = 1` 明天再来；
+  从没复习过的词收藏当天就到期。
+- **进队**：未毕业 且 `next_due ≤ 今天` 且今天（UTC 日）还没复习过。
+- **排序**：逾期最久（`next_due` 最早）的优先，其次从未复习过的优先（同档按收藏早、id 小）。
+- **毕业**：`stage` 到 `GRADUATE_STAGE = 3`（3 次封顶——原片里本来就会再遇见它，
+  不用把词卡在队列里刷到天荒地老）。毕业后不再进队，`/review/stats` 里单独计数。
 - **幂等**：同一天对同一张卡重复提交同一个 `result` 不再插行（返回 `duplicate: true`）；
   同一天改答另一个 result 会记录（用户改口是真实信息）。
 - 时间一律 UTC ISO8601 存 `Review.at`；`/review/stats` 的「今天」= UTC 日历日。
@@ -92,7 +96,8 @@ curl http://127.0.0.1:8000/review/stats
 
 ### 多界面
 
-顶栏是终端风 tab：`[ 播放 ] [ 生词本 ]`，快捷键 `V` 循环切换，`Esc` 回播放界面。
+顶栏是终端风 tab：`[ 播放 ] [ 内容库 ] [ 生词本 ] [ 复习 ]`，快捷键 `V` 按这个顺序
+循环切换，`Esc` 回播放界面。
 **播放是主界面**，其余界面全屏铺开；切走时视频自动暂停，切回来恢复原播放状态
 （切走前在播就接着播，切走前是暂停就还是暂停）。加界面只要在 JS 顶部的 `VIEWS`
 数组里加一行 + 加一个 `<section id="view-xxx" class="view">`，tab 自动长出来。
@@ -104,6 +109,12 @@ curl http://127.0.0.1:8000/review/stats
   来自浏览器划词插件的 encounter 显示 `🌐 页面标题`（网页没有时间轴，不给「去这句」）。
   数据只在**打开这个界面时拉一次**（`/vocab` 一次 + 每张卡的 `/mnemonic` 各一次），
   **不轮询**；worker 后来生成的助记要点右上角的「刷新」才会出现。
+- **复习界面**：翻卡。正面给词元 + 音标 + 例句（例句里的目标词用 `▓▓▓` 遮住，
+  固定三格不泄露词长），空格 / 回车 / 点卡片翻面看词典释义 + 助记；
+  `J` = 会、`K` = 不会（未翻面也能直接答），答完自动下一张；顶栏显示今日剩余 /
+  已复习 / 答对率 / 档位分布，卡头显示 `stage x/3` 与逾期天数；翻面后点例句
+  （或「去这句」）跳回原片那一秒，队列清空是终端风空态 + 一键回播放界面。
+  队列走 `/review/next`，答案走 `/review/answer`，请求全带 8s 超时 + 失败重试。
 
 ### 字幕三档与遮罩
 

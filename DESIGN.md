@@ -28,7 +28,7 @@ app/
 ├── db.py          # SQLite schema + 连接登记簿（表结构见 §2）
 ├── ecdict.py      # ECDICT 查询 + Lexeme 回填口径（server / annotate 共用，不依赖 web）
 ├── ingest.py      # srt → Content/Segment/token/lemma 入库
-├── review.py      # M1 复习规则（滚动窗口 + 会/不会 + 毕业；纯 SQLite，见 §7）
+├── review.py      # M1 复习规则（间隔重复简化版 1/3/7 + 会/不会 + 毕业；纯 SQLite，见 §7）
 ├── server.py      # FastAPI：API + Range 媒体接口 + 静态托管 player
 ├── annotate.py    # 异步助记 worker（AnnotationJob 队列驱动，provider 可插拔）
 ├── providers/     # anthropic.py（现在）/ deepseek.py（预留，钩子生成的目标提供方）
@@ -149,12 +149,13 @@ id = AnnotationJob.id，批量对位的唯一依据）：
 
 - lemma 库：默认 simplemma（纯 Python 零模型）；验收不达标升级 spaCy。
 - Wiktionary 词源解析（事实区的前置条件），远期。
-- 复习调度：M1 先"最近几天滚动 + 会/不会"，FSRS 以后再说。
-  **后端已落地**（工单 9，UI 仍冻结）：规则在 `app/review.py` 的常量里——
-  进队 = 未毕业 且 今天(UTC)没复习过 且（`added_at` 在最近 `REVIEW_WINDOW_DAYS=7`
-  天内 或 历史上答过 dont）；排序 = 从未复习最优先，其次上次复习最早；
-  毕业 = 末尾连续 `GRADUATE_STREAK=2` 次 know 且**最后一次复习**距首次收藏
-  ≥ `GRADUATE_MIN_AGE_DAYS=3` 天。端点：`GET /review/next?limit=`、
+- 复习调度：M1 先"间隔重复简化版 + 会/不会"，FSRS 以后再说。
+  **后端 + 界面都已落地**（工单 9 后端 / 工单 14 第四界面）：规则在 `app/review.py`
+  的常量里——stage 由 Review 事件流重放推导（know 进一档、dont 归零，老库零迁移）；
+  next_due = 最后一次复习那天 + `INTERVALS=(1,3,7)[stage-1]`（答错按
+  `DONT_INTERVAL_DAYS=1` 明天再来）；进队 = 未毕业 且 next_due ≤ 今天 且
+  今天(UTC)没复习过；排序 = 逾期最久优先，其次从未复习优先；
+  毕业 = stage 到 `GRADUATE_STAGE=3`（3 次封顶）。端点：`GET /review/next?limit=`、
   `POST /review/answer {vocab_entry_id, result}`（同日同答案幂等）、`GET /review/stats`。
 - DeepSeek provider 正式接入（含费用核算脚本）。
 - ~~重构债：ECDICT 查询/回填口径（EcdictStore 等）现居 app/server.py，annotate worker
