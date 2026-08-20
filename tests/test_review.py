@@ -105,18 +105,53 @@ def day_str(dt: datetime) -> str:
 
 
 def test_rules_are_the_simplified_sr_ladder(conn):
-    """口径体检：3 次封顶、间隔表与毕业档对齐（改常量时这条先响）。"""
-    assert R.GRADUATE_STAGE == 3 == len(R.INTERVALS)
-    assert list(R.INTERVALS) == [1, 3, 7]
+    """口径体检：答对 3 次毕业、生效间隔 1/3 天（改常量时这条先响）。"""
+    assert R.GRADUATE_STAGE == 3
+    assert list(R.INTERVALS) == [1, 3]
     assert R.interval_days(0) == R.DONT_INTERVAL_DAYS == 1
-    assert [R.interval_days(s) for s in (1, 2, 3)] == [1, 3, 7]
+    assert [R.interval_days(s) for s in (1, 2)] == [1, 3]
     assert R.rules() == {
-        "intervals": [1, 3, 7],
+        "intervals": [1, 3],
         "graduate_stage": 3,
         "dont_interval_days": 1,
         "once_per_day": True,
         "results": ["know", "dont"],
     }
+
+
+def test_every_interval_is_actually_reachable(conn):
+    """工单 17-5 的回归点：间隔表里不许再有"永远轮不到"的那一档。
+
+    答对第 GRADUATE_STAGE 次就毕业，从此不再排 next_due —— 所以间隔表恰好该有
+    GRADUATE_STAGE - 1 个数。多写一个（比如以前的 7 天），文案上写着、实际从来
+    没人用过，两句话对不上。
+    """
+    assert len(R.INTERVALS) == R.GRADUATE_STAGE - 1, (
+        "间隔表比 GRADUATE_STAGE - 1 长 = 最后那些间隔永远生效不了；"
+        "要么删掉多余的间隔，要么把 GRADUATE_STAGE 提上去"
+    )
+    # 逐档验一遍：每个间隔都真的被某个未毕业的 stage 用上了
+    for stage, days in enumerate(R.INTERVALS, start=1):
+        assert stage < R.GRADUATE_STAGE                 # 这一档还没毕业 = 还会再问
+        assert R.interval_days(stage) == days           # 用的就是表里这个数
+
+
+def test_three_knows_walk_1_then_3_then_graduate(conn):
+    """走一遍真实路径：+1 天 → +3 天 → 毕业（不再进队）。"""
+    entry = add_entry(conn, "stakeout", NOW - days(30))
+
+    add_review(conn, entry, R.RESULT_KNOW, NOW - days(10))
+    st = state_of(conn, entry)
+    assert st.stage == 1 and st.next_due == day_str(NOW - days(10) + days(1))
+
+    add_review(conn, entry, R.RESULT_KNOW, NOW - days(5))
+    st = state_of(conn, entry)
+    assert st.stage == 2 and st.next_due == day_str(NOW - days(5) + days(3))
+
+    add_review(conn, entry, R.RESULT_KNOW, NOW - days(1))
+    st = state_of(conn, entry)
+    assert st.stage == R.GRADUATE_STAGE and st.graduated is True
+    assert st.due is False                              # 毕业了就不再排队
 
 
 # --- 队列纳入 / 排除 --------------------------------------------------------
