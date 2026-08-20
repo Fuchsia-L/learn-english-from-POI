@@ -11,6 +11,11 @@
 （ro 连接会在库旁边生成 -wal/-shm 边车文件，那是 sqlite 读 WAL 库的必需品，
   .db 主文件字节不变——tests/test_doctor.py 有哈希断言守着。）
 
+**老库（v1）**：先看 `PRAGMA user_version` 与 Encounter 的列，再跑任何查询。
+Encounter 缺 source_kind/context_json 的 v1 库上，体检报 ✗ 并写清楚怎么迁
+（只读原则：doctor 自己一个字都不改），跳过依赖这两列的检查，退出码非零 ——
+而不是像以前那样抛一个 `no such column: source_kind` 的 traceback（工单 17-3）。
+
 用法:
     python -m app.doctor                       # 体检 data/poi.db 全部剧集
     python -m app.doctor --db /tmp/poi.db --content-id 3
@@ -191,8 +196,38 @@ def _human_size(n: int) -> str:
 # --- 1. schema -------------------------------------------------------------
 
 
+# v2 才有的列（工单 11 的 Encounter 泛化）。doctor 只读、绝不迁移，所以遇到
+# 老库只能报告，不能顺手改——但也不能像以前那样一头撞进 "no such column:
+# source_kind" 的 traceback 里（工单 17-3）。
+V2_ENCOUNTER_COLUMNS = ("source_kind", "context_json")
+
+# 老库该怎么迁：新版服务打开一次库就会自动迁（Database._ensure_schema → init_db），
+# 想手动来一下就跑这条命令。doctor 自己什么都不做。
+MIGRATE_HINT = (
+    "用新版服务打开一次这个库即可自动迁移"
+    "（uvicorn app.server:app / python -m app.server），"
+    "或手动跑 python -c \"from app.db import init_db; init_db('<db>').close()\""
+)
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """PRAGMA table_info → 列名。表不存在就是空列表（PRAGMA 不会抛）。"""
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def encounter_v2_gap(conn: sqlite3.Connection) -> list[str]:
+    """Encounter 少了哪些 v2 列（空列表 = 已经是 v2 形状）。"""
+    have = set(table_columns(conn, "Encounter"))
+    return [c for c in V2_ENCOUNTER_COLUMNS if c not in have]
+
+
 def check_schema(conn: sqlite3.Connection, report: Report) -> bool:
-    """表齐不齐 + user_version。表缺了就没法往下体检，返回 False。"""
+    """表齐不齐 + user_version + 列形状。没法往下体检就返回 False。
+
+    顺序是有讲究的：**先看 PRAGMA user_version 和 Encounter 的列，再跑任何查询**。
+    v1 老库（Encounter 没有 source_kind/context_json）上，后面那些 SQL 会直接
+    抛 "no such column"——那是一坨 traceback，不是体检报告。
+    """
     sec = "schema"
     have = {
         r["name"]
@@ -201,20 +236,39 @@ def check_schema(conn: sqlite3.Connection, report: Report) -> bool:
         )
     }
     missing = [t for t in TABLES if t not in have]
+    ver = _scalar(conn, "PRAGMA user_version")
+    gap = encounter_v2_gap(conn) if "Encounter" in have else []
     report.data["schema"] = {
         "tables_present": sorted(have),
         "tables_missing": missing,
-        "user_version": _scalar(conn, "PRAGMA user_version"),
+        "user_version": ver,
         "expected_version": SCHEMA_VERSION,
+        "encounter_columns": table_columns(conn, "Encounter") if "Encounter" in have else [],
+        "encounter_missing": gap,
+        "needs_migration": bool(gap),
     }
     if missing:
         report.fail(sec, f"缺 {len(missing)} 张表: {', '.join(missing)}", missing=missing)
         return False
-    ver = report.data["schema"]["user_version"]
+
+    if gap:
+        # 老库：报告清楚 + 非零退出（✗），但**不迁移**，也不再跑依赖这些列的检查。
+        report.fail(
+            sec,
+            f"老库（schema v{ver}，当前代码是 v{SCHEMA_VERSION}）："
+            f"Encounter 缺 {', '.join(gap)} 列。doctor 只读，不会替你迁移——"
+            f"{MIGRATE_HINT}；迁完再体检。",
+            user_version=ver,
+            expected=SCHEMA_VERSION,
+            encounter_missing=gap,
+        )
+        return True  # 媒体/时间轴/词框这些与 Encounter 无关的检查照常往下走
+
     if ver != SCHEMA_VERSION:
         report.warn(
             sec,
-            f"user_version={ver}，当前代码期望 {SCHEMA_VERSION}（老库？跑一次 python -m app.db 迁移）",
+            f"user_version={ver}，当前代码期望 {SCHEMA_VERSION}"
+            f"（表结构已经是新的，只是版本号没盖上；{MIGRATE_HINT}）",
             user_version=ver,
             expected=SCHEMA_VERSION,
         )
@@ -699,7 +753,17 @@ def check_summary(conn: sqlite3.Connection, report: Report) -> dict[str, Any]:
     else:
         report.ok(sec, "外键自洽，无孤儿行")
 
-    # web 来源的 Encounter 必须有 context_json，否则 /vocab 里那一行是个哑巴
+    # web 来源的 Encounter 必须有 context_json，否则 /vocab 里那一行是个哑巴。
+    # v1 老库根本没这两列：跳过并说明，绝不硬查（工单 17-3——硬查就是 traceback）。
+    gap = encounter_v2_gap(conn)
+    if gap:
+        report.warn(
+            sec,
+            f"跳过 web 来源 Encounter 的语境检查：老库缺 {', '.join(gap)} 列（见 schema 一节）",
+            skipped="encounter_context_json",
+            encounter_missing=gap,
+        )
+        return counts
     bad_web = _scalar(
         conn,
         "SELECT COUNT(*) FROM Encounter WHERE source_kind='web' AND "
