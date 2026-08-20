@@ -125,7 +125,10 @@ def post_import(
     srt: Path | None = None,
     audio: Path | None = None,
     boxes: Path | None = None,
+    origin: str | None = "http://127.0.0.1:8000",
 ):
+    """默认带上本机页面的 Origin —— 全部导入用例都照浏览器的真实姿势走一遍
+    跨站写入闸（工单 17-1 的 LocalWriteGuard），别让闸悄悄把内容库界面锁死。"""
     files = []
     for field, p, ctype in (
         ("video", video, "video/mp4"),
@@ -136,7 +139,10 @@ def post_import(
         if p is not None:
             files.append((field, (p.name, p.read_bytes(), ctype)))
     return client.post(
-        "/import", data={"title": title, "season_ep": season_ep}, files=files
+        "/import",
+        data={"title": title, "season_ep": season_ep},
+        files=files,
+        headers={"Origin": origin} if origin else {},
     )
 
 
@@ -328,6 +334,32 @@ def test_import_self_contained_video(client: TestClient, env: dict):
     assert "ep.mp4" in names and "ep.srt" in names and LIBRARY_META in names
     meta = json.loads((dirs[0] / LIBRARY_META).read_text(encoding="utf-8"))
     assert meta["has_audio"] is True and meta["merged"] is False
+
+
+def test_import_from_foreign_page_is_refused_end_to_end(client: TestClient, env: dict):
+    """工单 17-1：整条链路验一遍 —— 外站页面发的导入请求 403，磁盘上什么都不留。
+
+    与 tests/test_server.py 里那组的区别：这里用的是真视频 + 真 srt，
+    证明「被拒」不是因为素材不合法，而是因为 Origin 不是本机页面。
+    """
+    r = post_import(
+        client,
+        video=make_video(env["src"] / "evil.mp4", seconds=1.0),
+        srt=srt_file(env["src"] / "evil.srt"),
+        origin="https://evil.example",
+    )
+    assert r.status_code == 403 and "跨站" in r.json()["detail"]
+    assert work_dirs(env) == []
+    assert client.get("/import").json()["count"] == 0
+    assert client.get("/episodes").json()["episodes"] == []
+
+    # 同一份素材、换成本机 origin：照常导入成功（拒的是来源，不是素材）
+    job = import_ok(
+        client,
+        video=make_video(env["src"] / "ok.mp4", seconds=1.0),
+        srt=srt_file(env["src"] / "ok.srt"),
+    )
+    assert job["stage"] == "done"
 
 
 def test_import_merges_separate_audio_and_video(client: TestClient, env: dict):
