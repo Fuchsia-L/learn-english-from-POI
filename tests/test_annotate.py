@@ -914,8 +914,8 @@ def test_dry_run_carries_price_as_of(env: dict, monkeypatch):
     with make_worker(env, provider=get_provider("deepseek")) as w:
         info = w.dry_run()
     assert info["jobs"] == 1 and info["estimate_cny"] > 0
-    assert "as_of=2026-08-16" in info["price"]
-    assert info["price_as_of"] == "牌价 as_of=2026-08-16"
+    assert "as_of=2026-08-19" in info["price"]
+    assert info["price_as_of"] == "牌价 as_of=2026-08-19"
 
 
 def test_dry_run_price_empty_for_provider_without_prices(env: dict):
@@ -936,7 +936,7 @@ def test_cli_prints_price_as_of(env: dict, capsys, monkeypatch):
     ])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "牌价 as_of=2026-08-16" in out          # 启动行的短标注
+    assert "牌价 as_of=2026-08-19" in out          # 启动行的短标注
     assert "牌价(估算依据):" in out and "official price page" in out
     assert "以官方现价为准" in out
 
