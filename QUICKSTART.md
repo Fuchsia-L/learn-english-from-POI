@@ -86,7 +86,7 @@ python -m uvicorn app.server:app --port 8000
 # 先用假 provider 看流程（不花钱）
 python -m app.annotate --db data/poi.db --provider fake --once
 
-# 接真模型：塞 key 即切（DeepSeek deepseek-v4-flash，约 ¥0.004/词，按峰时价保守估）
+# 接真模型：塞 key 即切（DeepSeek deepseek-v4-flash，约 ¥0.001/词，按 cache-miss 保守估）
 set DEEPSEEK_API_KEY=sk-...        # PowerShell: $env:DEEPSEEK_API_KEY="sk-..."
 python -m app.annotate --db data/poi.db --provider deepseek --once --budget 4
 
@@ -117,9 +117,10 @@ curl -X POST http://127.0.0.1:8000/review/answer -H 'content-type: application/j
 curl http://127.0.0.1:8000/review/stats                                 # 今日已复习/待复习/毕业
 ```
 
-规则（间隔重复简化版）：新收藏当天就到期；答 `know` 进一档，按 1 / 3 / 7 天的间隔
-再问，答对 3 次就毕业、不再出现；答 `dont` 档位归零、明天再来；同一天同一个词只出现
-一次，重复提交同一答案幂等。改规则改 `app/review.py` 顶部的常量即可（历史按新规则自动重推）。
+规则（间隔重复简化版）：新收藏当天就到期；答 `know` 进一档 —— 第 1 次答对隔 1 天
+再问、第 2 次隔 3 天，**第 3 次答对直接毕业、不再出现**；答 `dont` 档位归零、明天再来；
+同一天同一个词只出现一次，重复提交同一答案幂等。所以生效的间隔就 1 / 3 两档
+（毕业档没有"下一次"）。改规则改 `app/review.py` 顶部的常量即可（历史按新规则自动重推）。
 
 ## 7. 浏览器划词插件（M3-lite）
 

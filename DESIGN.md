@@ -28,7 +28,7 @@ app/
 ├── db.py          # SQLite schema + 连接登记簿（表结构见 §2）
 ├── ecdict.py      # ECDICT 查询 + Lexeme 回填口径（server / annotate 共用，不依赖 web）
 ├── ingest.py      # srt → Content/Segment/token/lemma 入库
-├── review.py      # M1 复习规则（间隔重复简化版 1/3/7 + 会/不会 + 毕业；纯 SQLite，见 §7）
+├── review.py      # M1 复习规则（间隔重复简化版 1/3 天 + 会/不会 + 毕业；纯 SQLite，见 §7）
 ├── server.py      # FastAPI：API + Range 媒体接口 + 静态托管 player
 ├── annotate.py    # 异步助记 worker（AnnotationJob 队列驱动，provider 可插拔）
 ├── providers/     # anthropic.py（现在）/ deepseek.py（预留，钩子生成的目标提供方）
@@ -72,6 +72,14 @@ scripts/
   (浏览器划词插件专用;CORS 仅对扩展 origin 放行本端点与 /lookup)
 - `GET /vocab` → 生词本（lexeme 卡 + encounters 展开）
 - `GET /mnemonic?lexeme_id=` → done 则返回内容，否则返回 job status（前端轮询）
+- `POST /import`（multipart：title/season_ep/video/srt/audio?/boxes?）→ 202 + job_id，
+  后台跑「ffprobe 校验 → ffmpeg 合并 → 原子 ingest」；`GET /import/{job_id}` 轮询进度，
+  `GET /import` 看最近几次（工单 12，实现在 app/library.py）。
+  - **写入闸（工单 17-1）**：CORS 只挡读不挡写（multipart 是简单请求，浏览器直接发），
+    所以在 ASGI 层、**解析 multipart 之前**认 Origin —— 本机页面 origin 或无 Origin
+    （本机 CLI）放行，外站 / `null` / 扩展 origin 一律 403 且不读请求体。
+  - **只新增不覆盖（工单 17-2）**：入库走裸 INSERT 撞唯一索引，并发的同名导入必定
+    一成一败，败的那个连自己的 uuid 媒体目录一起清掉（CLI 的 ingest 仍是幂等覆盖）。
 
 ## 4. 播放器（v0.3：多界面结构）
 
@@ -130,7 +138,8 @@ id = AnnotationJob.id，批量对位的唯一依据）：
   queued，高优先级同样停——成本不明时一分钱不花；独立退出码与计数器，与预算耗尽区分。
 - provider 现实（v0.4）：DeepSeek 默认 deepseek-v4-flash，请求体显式
   `"thinking":{"type":"disabled"}`（官方默认开启 thinking 且 effort=high）；估价一律按
-  峰时+cache-miss 的保守上界计。
+  cache-miss 输入的保守上界计（官方牌价：命中 ¥0.02 / 未命中 ¥1 / 输出 ¥2，每百万
+  token，**不分时段**——工单 17-4 修正了此前写错的峰谷两档价）。
   预算检查与费用累计发生在**每一次真实 provider 调用之前**（重试也计费，
   否则一批重试 3 次就能把 ¥4 烧成 ¥12，工单 6-1）；高优先级不受限但费用照记。
 
@@ -152,10 +161,11 @@ id = AnnotationJob.id，批量对位的唯一依据）：
 - 复习调度：M1 先"间隔重复简化版 + 会/不会"，FSRS 以后再说。
   **后端 + 界面都已落地**（工单 9 后端 / 工单 14 第四界面）：规则在 `app/review.py`
   的常量里——stage 由 Review 事件流重放推导（know 进一档、dont 归零，老库零迁移）；
-  next_due = 最后一次复习那天 + `INTERVALS=(1,3,7)[stage-1]`（答错按
+  next_due = 最后一次复习那天 + `INTERVALS=(1,3)[stage-1]`（答错按
   `DONT_INTERVAL_DAYS=1` 明天再来）；进队 = 未毕业 且 next_due ≤ 今天 且
   今天(UTC)没复习过；排序 = 逾期最久优先，其次从未复习优先；
-  毕业 = stage 到 `GRADUATE_STAGE=3`（3 次封顶）。端点：`GET /review/next?limit=`、
+  毕业 = stage 到 `GRADUATE_STAGE=3`（答对 3 次封顶）。**间隔表恰好 GRADUATE_STAGE-1
+  格**——最后一次答对即毕业，没有下一次到期（工单 17-5 删掉了那个永远轮不到的 7 天）。端点：`GET /review/next?limit=`、
   `POST /review/answer {vocab_entry_id, result}`（同日同答案幂等）、`GET /review/stats`。
 - DeepSeek provider 正式接入（含费用核算脚本）。
 - ~~重构债：ECDICT 查询/回填口径（EcdictStore 等）现居 app/server.py，annotate worker
