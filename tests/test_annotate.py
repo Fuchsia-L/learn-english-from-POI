@@ -377,7 +377,7 @@ def test_budget_is_not_blown_by_retries(env: dict, logs: list):
         "SELECT COUNT(*) c FROM AnnotationJob WHERE status = 'queued'"
     ).fetchone()["c"]
     conn.close()
-    assert left == 3  # 没送出去的（含被预算掐掉的那批）全部保持 queued
+    assert left == 3  # 没送出去的（含被预算提掉的那批）全部保持 queued
 
 
 def test_every_retry_is_charged(env: dict):
@@ -528,7 +528,7 @@ def test_failed_after_two_retries(env: dict):
 
 
 def test_schema_violation_rejects_and_fails_job(env: dict, logs: list):
-    """畸形输出必须被 schema 拦住：重试用尽 → failed，一行 Mnemonic 都不许落库。"""
+    """畦形输出必须被 schema 拦住：重试用尽 → failed，一行 Mnemonic 都不许落库。"""
     job = enqueue(env["db"], "gardener")
     p = FakeProvider(bad_output_on="gardener")
     with make_worker(env, provider=p, retries=2, logs=logs) as w:
@@ -914,8 +914,8 @@ def test_dry_run_carries_price_as_of(env: dict, monkeypatch):
     with make_worker(env, provider=get_provider("deepseek")) as w:
         info = w.dry_run()
     assert info["jobs"] == 1 and info["estimate_cny"] > 0
-    assert "as_of=2026-08-19" in info["price"]
-    assert info["price_as_of"] == "牌价 as_of=2026-08-19"
+    assert "as_of=2026-08-20" in info["price"]
+    assert info["price_as_of"] == "牌价 as_of=2026-08-20"
 
 
 def test_dry_run_price_empty_for_provider_without_prices(env: dict):
@@ -936,7 +936,7 @@ def test_cli_prints_price_as_of(env: dict, capsys, monkeypatch):
     ])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "牌价 as_of=2026-08-19" in out          # 启动行的短标注
+    assert "牌价 as_of=2026-08-20" in out          # 启动行的短标注
     assert "牌价(估算依据):" in out and "official price page" in out
     assert "以官方现价为准" in out
 
