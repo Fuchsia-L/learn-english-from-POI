@@ -10,7 +10,7 @@
 - [x] 可点击字幕的本地播放器 (`app/static/player.html`) — 多界面（播放 / 内容库 / 生词本 / 复习）+ 字幕三档 + 忽略白色的自然模糊遮罩 + OCR 词框热区 + 查询卡 + 助记展示
 - [x] AI 助记异步生成骨架 (`app/annotate.py` + `app/providers/`) — 队列驱动 worker、provider 插件层、预算制、JSON schema 校验；离线 `fake` provider 全链路可跑，塞 key 即切真 provider
 - [x] 预热词表 (`scripts/build_cet46.py`) — CET4+CET6 大纲词表 → `data/cet46.txt`（lemma 归一、去重）
-- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 间隔重复简化版（1/3/7 天、答对 3 次毕业、答错归零）+ 会/不会，纯 SQLite、不碰 LLM
+- [x] 复习闭环的**后端** (`app/review.py` + `/review/next|answer|stats`) — 间隔重复简化版（1/3 天、答对 3 次毕业、答错归零）+ 会/不会，纯 SQLite、不碰 LLM
 - [x] 浏览器划词插件 (`extension/`) — 任意网页选中英文词 → ⌖ 浮标 → 终端风查询卡 → 收进同一个生词本（`POST /collect/web`，encounter 记 URL + 整句）
 - [x] 复习界面 (`app/static/player.html` 第四个界面) — 翻卡（正面遮住例句里的目标词）+ `J` 会 / `K` 不会 + 逾期与档位分布 + 一键跳回原句
 
@@ -49,12 +49,22 @@ python -m app.server --db data/poi.db --ecdict data/ecdict.db --port 8000   # �
 端点见 DESIGN §3：`/episodes`、`/media/{content_id}`（HTTP Range，拖进度条用）、
 `/segments?content_id=`、`/lookup?surface=&segment_id=`（`segment_id` 可省，裸查词）、
 `POST /collect`、`POST /collect/web`（浏览器划词插件，见下）、`/vocab`、
-`/mnemonic?lexeme_id=`；`/` 重定向到 `/static/player.html`。全程本地 SQLite，无网络调用；
+`/mnemonic?lexeme_id=`、`POST /import` 与 `/import[/{job_id}]`（内容库导入，见下）；
+`/` 重定向到 `/static/player.html`。全程本地 SQLite，无网络调用；
 `data/ecdict.db` 缺失时 `/lookup` 降级为 `in_dict=false` 而不报错。
 
 服务只监听 `127.0.0.1`，并且**只**给 `/lookup` 与 `/collect/web` 两个端点发 CORS 放行头，
 且只认 `chrome-extension://` / `moz-extension://` 这类扩展 origin —— 别的网页的 JS
 读不走生词本，别的端点（`/vocab`、`/segments`、`/review/*`…）一律没有跨域许可。
+
+**但 CORS 只挡读、不挡写**：`multipart/form-data` 是「简单请求」，浏览器不预检、
+直接发出去，只是不把回包交给发起页面的 JS。也就是说随便哪个网站都能往
+`127.0.0.1:8000/import` 塞一份 multipart，服务照收照落盘 —— 攻击者读不到结果，
+但你的磁盘和库已经被写了。所以 `POST /import` 另有一道 **ASGI 层的写入闸**
+（`LocalWriteGuard`，工单 17-1）：**在解析 multipart 之前**看 `Origin` ——
+本机页面（`http(s)://localhost | 127.0.0.1 | [::1]`，端口不限）放行，
+没有 `Origin` 的本机 CLI（curl/脚本）放行，其余（外站、`null`、扩展 origin）
+一律 403，且一个字节的上传都不会被读进来。
 
 ECDICT 的查询/回填口径住在 `app/ecdict.py`，`app/server.py` 和 `app/annotate.py` 共用
 同一份实现——worker 不 import web 层（`import app.annotate` 不会拖进 fastapi），
@@ -74,12 +84,16 @@ curl http://127.0.0.1:8000/review/stats
 
 - **档位（stage）**：不建列，由 `Review` 事件流按时间重放推导——`know` 进一档（封顶），
   `dont` 归零。改规则不用迁库，历史自动按新规则重推。
-- **间隔**：`INTERVALS = (1, 3, 7)` 天——答对后 `next_due` = 最后一次复习那天 +
-  `INTERVALS[stage-1]`；答 `dont` 按 `DONT_INTERVAL_DAYS = 1` 明天再来；
-  从没复习过的词收藏当天就到期。
+- **间隔**：`INTERVALS = (1, 3)` 天——答对后 `next_due` = 最后一次复习那天 +
+  `INTERVALS[stage-1]`（答对第 1 次隔 1 天、第 2 次隔 3 天，第 3 次直接毕业）；
+  答 `dont` 按 `DONT_INTERVAL_DAYS = 1` 明天再来；从没复习过的词收藏当天就到期。
+  **间隔表恰好比毕业档少一格**：最后一次答对即毕业，不再有"下次到期"——所以
+  这里只有两个数。（工单 17-5 之前写的是 `(1, 3, 7)`，那个 7 天永远轮不到，
+  "1/3/7 天"和"答对 3 次毕业"根本不可能同时成立；想真用 7 天就得把
+  `GRADUATE_STAGE` 提到 4。）
 - **进队**：未毕业 且 `next_due ≤ 今天` 且今天（UTC 日）还没复习过。
 - **排序**：逾期最久（`next_due` 最早）的优先，其次从未复习过的优先（同档按收藏早、id 小）。
-- **毕业**：`stage` 到 `GRADUATE_STAGE = 3`（3 次封顶——原片里本来就会再遇见它，
+- **毕业**：`stage` 到 `GRADUATE_STAGE = 3`（答对 3 次封顶——原片里本来就会再遇见它，
   不用把词卡在队列里刷到天荒地老）。毕业后不再进队，`/review/stats` 里单独计数。
 - **幂等**：同一天对同一张卡重复提交同一个 `result` 不再插行（返回 `duplicate: true`）；
   同一天改答另一个 result 会记录（用户改口是真实信息）。
@@ -208,7 +222,7 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
   就是坏了，不确定成本时一分钱都不许花。绝不再按 ¥0 继续跑。
 - 免责标签由**代码**兜底，不指望模型自觉：`morph` 拆分永远标"未经词源核验"，
   其余 hook 一律带"非词源"。没有事实区（DESIGN §5：`factual` 已处决）。
-- 单任务失败、provider 抛任何异常、落库出错都不会掀翻 worker。
+- 单任务失败、provider 抛任何异常、落库出错都不会掸翻 worker。
 
 ### 调提示词
 
@@ -220,18 +234,20 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
 system + user prompt。
 
 价目表写在各 provider 模块顶部的常量里（`app/providers/deepseek.py` 是
-`PRICE_*_CNY_PER_MTOK` 一组**官方人民币牌价 2026-08**，直接给到类上的
-`price_in_cny_per_mtok` / `price_out_cny_per_mtok`——**变价改这一处**），
-**随时可能过期，自己核对官网后改**。deepseek-v4-flash：峰时输入（cache-miss）
-¥3.0/百万 token、输出 ¥9.0/百万 token；错峰减半、缓存命中 ¥0.10 只作注释备查，
-**不参与估算**（保守原则）。峰时 = 北京时间 9:00–12:00 与 14:00–18:00。
+`PRICE_*_CNY_PER_MTOK` 一组**官方人民币牌价，`PRICE_AS_OF = 2026-08-19`**，直接给到
+类上的 `price_in_cny_per_mtok` / `price_out_cny_per_mtok`——**变价改这一处**），
+**随时可能过期，自己核对官网后改**。deepseek-v4-flash（元 / 百万 token）：
+输入缓存未命中 **¥1**、输出 **¥2**（估价用这两个）；输入缓存命中 ¥0.02 只作注释备查，
+**不参与估算**（保守原则）。**没有分时段的峰谷价**——旧版 README 写的
+「峰时 ¥3/¥9、错峰减半、北京时间 9-12/14-18」是错的，官方价目页只有上面三个数
+（工单 17-4 已改；来源见 `PRICE_SOURCE`：api-docs.deepseek.com/zh-cn/quick_start/pricing/）。
 
 DeepSeek 默认模型是 **`deepseek-v4-flash`**（旧的 `deepseek-chat` / `deepseek-reasoner`
 已被官方宣布退役）。该系列**默认开 thinking 且 effort=high**，助记生成用不上，
 请求体里已显式写死 `"thinking": {"type": "disabled"}`，不然要重度多计费。
 换模型用 `--model`（只对真 provider 有意义，`fake` 忽略）。
-估价一律按**峰时 + cache-miss**（牌价最贵那档）算 —— 预算是硬顶，不许乐观估。
-按默认 `--batch-size 4` 算下来约 **¥0.0039/词**，¥4 预算够跑 ~1000 个词。
+估价一律按 **cache-miss 输入**（牌价里贵的那档）算 —— 预算是硬顶，不许乐观估。
+按默认 `--batch-size 4` 算下来约 **¥0.001/词**，¥4 预算够跑 ~4000 个词。
 
 ## build_cet46：预热词表
 
@@ -299,6 +315,22 @@ extension/
 服务端配套：`POST /collect/web {surface, sentence, url, title}`（与 `/collect` 同一条链路、
 同一套幂等口径），`Encounter` 泛化为 `segment_id` 可空 + `source_kind`（`segment|web`）+
 `context_json`；CORS 只对 `/lookup` 与 `/collect/web`、且只对扩展 origin 放行。
+
+**插件的 7 个端到端用例（`tests/test_extension_e2e.py`，标记 `slow`）要装了
+Playwright chromium 才算数**：
+
+```bash
+PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers playwright install chromium
+pytest tests/test_extension_e2e.py            # 7 passed 才是真通过
+```
+
+没装浏览器时这 7 个是 **skipped，不是 passed** —— 跳过的用例一个字都没验，
+别把它们计进通过数（工单 17-6）。除"浏览器二进制不存在"以外的一切失败
+（浏览器起不来 / manifest 不合法 / 内容脚本没注入）现在都判 **fail**，
+不再伪装成环境问题跳过。manifest 的形状（MV3、Chrome 的 `service_worker` 与
+Firefox 121+ 的 `scripts` 两个 background 键都在、权限最小、声明的文件都在）另有
+`tests/test_extension_manifest.py` 守着 —— 它既不依赖浏览器也不依赖 node，
+任何机器上都真跑。
 
 ## extract_hardsub.py
 
