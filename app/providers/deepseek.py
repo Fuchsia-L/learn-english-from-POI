@@ -5,7 +5,7 @@ DESIGN §5 里点名的钩子生成目标提供方——中文谐音/联想它�
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...
-python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \\
+python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
     --provider deepseek --loop --budget 4.0
 # 换模型（只对真 provider 有意义）
 python -m app.annotate --db data/poi.db --provider deepseek --model deepseek-v4 --dry-run

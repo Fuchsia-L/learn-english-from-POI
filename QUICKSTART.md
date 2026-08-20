@@ -23,7 +23,7 @@ python scripts/build_ecdict.py        # 构建本地词典 data/ecdict.db（77 �
 ## 2. 从硬字幕片源制作字幕（每集一次）
 
 ```bash
-python scripts/extract_hardsub.py 第一集.mp4 \\
+python scripts/extract_hardsub.py 第一集.mp4 \
   -o data/ep01.en.srt --boxes-json data/ep01.boxes.json
 ```
 
@@ -40,7 +40,7 @@ python scripts/extract_hardsub.py 第一集.mp4 \\
 只拿了视频流就是这个结果。先自检：
 
 ```bash
-ffprobe -v error -show_entries stream=codec_type,codec_name \\
+ffprobe -v error -show_entries stream=codec_type,codec_name \
   -of default=noprint_wrappers=1 你的视频.mp4
 ```
 
@@ -65,7 +65,7 @@ ffmpeg -i 合并后.mp4 -c:v libx264 -crf 20 -preset veryfast -c:a copy 兼容�
 ## 3. 入库
 
 ```bash
-python -m app.ingest data/ep01.en.srt --title POI --season-ep s01e01 \\
+python -m app.ingest data/ep01.en.srt --title POI --season-ep s01e01 \
   --video 第一集.mp4 --db data/poi.db --boxes-json data/ep01.boxes.json
 ```
 
@@ -112,7 +112,7 @@ python scripts/prefetch.py --db data/poi.db --content-id 1 --limit 200
 
 ```bash
 curl 'http://127.0.0.1:8000/review/next?limit=20'                       # 今日待复习卡
-curl -X POST http://127.0.0.1:8000/review/answer -H 'content-type: application/json' \\
+curl -X POST http://127.0.0.1:8000/review/answer -H 'content-type: application/json' \
      -d '{"vocab_entry_id": 1, "result": "know"}'                       # know / dont
 curl http://127.0.0.1:8000/review/stats                                 # 今日已复习/待复习/毕业
 ```
