@@ -377,7 +377,7 @@ def test_budget_is_not_blown_by_retries(env: dict, logs: list):
         "SELECT COUNT(*) c FROM AnnotationJob WHERE status = 'queued'"
     ).fetchone()["c"]
     conn.close()
-    assert left == 3  # 没送出去的（含被预算提掉的那批）全部保持 queued
+    assert left == 3  # 没送出去的（含被预算掐掉的那批）全部保持 queued
 
 
 def test_every_retry_is_charged(env: dict):
@@ -528,7 +528,7 @@ def test_failed_after_two_retries(env: dict):
 
 
 def test_schema_violation_rejects_and_fails_job(env: dict, logs: list):
-    """畦形输出必须被 schema 拦住：重试用尽 → failed，一行 Mnemonic 都不许落库。"""
+    """畸形输出必须被 schema 拦住：重试用尽 → failed，一行 Mnemonic 都不许落库。"""
     job = enqueue(env["db"], "gardener")
     p = FakeProvider(bad_output_on="gardener")
     with make_worker(env, provider=p, retries=2, logs=logs) as w:
