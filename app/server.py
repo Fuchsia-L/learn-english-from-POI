@@ -144,6 +144,84 @@ class ExtensionCORS:
         await self.app(scope, receive, send_with_cors)
 
 
+# --- 写端点的跨站防护（工单 17-1） ------------------------------------------
+# CORS 挡的是**读**，不是**写**：multipart/form-data 是所谓「简单请求」，浏览器
+# 不预检、直接发出去，只是不把响应交给发起页面的 JS。也就是说随便哪个网站的
+# 一段 <form> 或 fetch 都能往 127.0.0.1:8000/import 塞一份 multipart，服务照收、
+# 照落盘、照起后台线程 —— 攻击者读不到回包，但库和磁盘已经被写了。
+# 「没给 CORS 响应头」因此不能当写入保护用。写端点必须自己认 Origin：
+#   - 没有 Origin 头：本机 CLI（curl / 脚本 / requests）。浏览器发的跨站请求一定
+#     带 Origin，所以放行不会给网页开口子。
+#   - Origin 是本机页面（http(s)://localhost | 127.0.0.1 | [::1] [:port]）：放行，
+#     播放器自己的「内容库」界面走的就是这条。
+#   - 其余一律 403：外站 origin、以及 "null"（sandbox iframe / file:// / 重定向后
+#     的不透明 origin —— 恰恰是攻击者最容易搞出来的那个值）。
+GUARDED_WRITE_PATHS = frozenset({"/import"})
+# 只有会改状态的方法要过闸：GET /import（看最近几次导入）不写任何东西。
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# 本机页面的 origin：三个回环主机名 + 可选端口，别的一律不认（127.0.0.2 之类
+# 也不认 —— 播放器就住在这三个名字上，放宽只会多一片攻击面）。
+_LOCAL_ORIGIN_RE = re.compile(
+    r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$", re.IGNORECASE
+)
+
+
+def is_local_origin(origin: str | None) -> bool:
+    """Origin 是不是本机页面（localhost / 127.0.0.1 / [::1]，端口不限）。"""
+    return bool(origin) and _LOCAL_ORIGIN_RE.match(origin or "") is not None
+
+
+class LocalWriteGuard:
+    """跨站写入拦截：POST /import 只认本机 Origin，且在**读请求体之前**就拒。
+
+    写成裸 ASGI 中间件而不是 FastAPI 依赖 / 路由里的检查：Form(...) / File(...)
+    这些参数是靠 multipart 解析器填的，解析发生在依赖和路由函数之前 —— 等代码
+    跑到路由体里，几个 G 的上传早就读完落盘了。只有在 ASGI 层挡，才谈得上
+    「一个字节都没读」：这里直接 send 403，从不 await receive()。
+    """
+
+    DENY_DETAIL = (
+        "拒绝跨站导入：这个端点只接受本机页面（localhost/127.0.0.1）或本机命令行的请求"
+    )
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @staticmethod
+    def _header(scope: dict, name: bytes) -> str | None:
+        for k, v in scope.get("headers", []):
+            if k == name:
+                return v.decode("latin-1")
+        return None
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") == "http"
+            and scope.get("path") in GUARDED_WRITE_PATHS
+            and str(scope.get("method", "")).upper() not in SAFE_METHODS
+        ):
+            origin = self._header(scope, b"origin")
+            # 没有 Origin = 本机 CLI，放行；有 Origin 就必须是本机页面
+            if origin is not None and not is_local_origin(origin):
+                body = json.dumps(
+                    {"detail": self.DENY_DETAIL}, ensure_ascii=False
+                ).encode("utf-8")
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 403,
+                        "headers": [
+                            (b"content-type", b"application/json; charset=utf-8"),
+                            (b"content-length", str(len(body)).encode("latin-1")),
+                            (b"vary", b"Origin"),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -288,7 +366,7 @@ class CollectIn(BaseModel):
 class CollectWebIn(BaseModel):
     """POST /collect/web：浏览器划词插件的收藏（工单 11）。
 
-    除 surface 外全可空 —— 插件在再刁钻的页面上也能退化成"光收词"，
+    除 surface 外全可空 —— 插件在再吊钻的页面上也能退化成"光收词"，
     不因为句子没截到 / 页面没标题就收藏失败。
     """
 
@@ -357,6 +435,9 @@ def create_app(
 
     # CORS：只给划词插件的两个端点开口子（工单 11，实现见 ExtensionCORS）
     app.add_middleware(ExtensionCORS)
+    # 跨站写入拦截：POST /import 只认本机 Origin（工单 17-1，实现见 LocalWriteGuard）。
+    # 后加 = 更外层，所以它在 CORS 之前跑：跨站的导入请求连 multipart 解析器都碰不到。
+    app.add_middleware(LocalWriteGuard)
 
     static_dir = Path(__file__).resolve().parent / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
