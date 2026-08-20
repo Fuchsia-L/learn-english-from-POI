@@ -79,9 +79,9 @@ REF_W, REF_H = 1920, 1080
 CN_BAND = (958, 1030)
 EN_BAND = (1026, 1080)
 
-# 词典释义里的分隔符是字面两个字符 "\\n"（见 build_ecdict._clean_text），
+# 词典释义里的分隔符是字面两个字符 "\n"（见 build_ecdict._clean_text），
 # 前端必须 split 后逐行显示 —— 给 stakeout 塞一条两行释义来验。
-# 这条释义还会被 fake provider 抄进 context_gloss，顺带验助记正文也按字面 \\n 拆行。
+# 这条释义还会被 fake provider 抄进 context_gloss，顺带验助记正文也按字面 \n 拆行。
 STAKEOUT_GLOSS = "n. 盯梢；监视\\nv. 蹲守盯住"
 
 # --- 暗场景夹具（真实片段回归：暗背景 + 白字最容易把遮罩糊成亮条） ----------
@@ -435,7 +435,7 @@ def test_click_hotspot_opens_lookup_card(player):
     body = player.inner_text("#cardBody")
     assert "stakeout" in body                    # 当前形式 + 词元
     assert "ˈsteɪkaʊt" in body                   # 音标
-    # 释义里的字面 "\\n" 必须 split 后逐行显示
+    # 释义里的字面 "\n" 必须 split 后逐行显示
     lines = player.eval_on_selector_all("#cardBody .gloss div", "ns => ns.map(n => n.textContent)")
     assert lines == ["n. 盯梢；监视", "v. 蹲守盯住"]
     # 原句 + 点中的词高亮
@@ -630,8 +630,8 @@ def test_vocab_view_renders_full_cards(player):
 def test_mnemonic_polls_and_renders_in_card_and_vocab(player, workspace):
     """DESIGN §5：助记异步生成，前端轮询 /mnemonic 展示 gloss + hooks。"""
     goto_segment(player, 1)
-    # 用 stakeout：它的词典释义是两行（字面 "\\n" 分隔），fake provider 会把这条
-    # 释义抄进 context_gloss —— 正好验助记正文也按字面 \\n 拆行，不许原样吐出来
+    # 用 stakeout：它的词典释义是两行（字面 "\n" 分隔），fake provider 会把这条
+    # 释义抄进 context_gloss —— 正好验助记正文也按字面 \n 拆行，不许原样吐出来
     open_card(player, "#hots .hot[data-surface='stakeout']")
     player.click("#collectBtn")
     player.wait_for_function(
@@ -651,7 +651,7 @@ def test_mnemonic_polls_and_renders_in_card_and_vocab(player, workspace):
     assert player.locator("#cardMnemo .hook").count() >= 1
     assert player.locator("#cardMnemo .hook .badge").first.inner_text() == "morph"
     assert "未经词源核验" in body                      # 免责标签必须在场（DESIGN §5）
-    # 助记正文按字面 "\\n" 拆行（provider 把两行词典释义抄进了 context_gloss）
+    # 助记正文按字面 "\n" 拆行（provider 把两行词典释义抄进了 context_gloss）
     assert "\\n" not in body, "助记里的字面 \\n 没拆行"
     assert "盯梢；监视" in body and "蹲守盯住" in body
     gloss_text = player.inner_text("#cardMnemo .mgloss")
