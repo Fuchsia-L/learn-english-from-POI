@@ -692,7 +692,7 @@ def test_no_socket_usage(client: TestClient, env: dict, monkeypatch):
 def test_lifespan_closes_every_thread_connection(env: dict):
     """TestClient 退出后：两个库的所有连接（含线程池里那些）必须已经关掉。
 
-    Windows 上没关的连接会锁住 .db 文件，用户删不掉也重建不了。
+    Windows 上没关的连接会锁住 .db 文件，用户删不掉也重建不了词典。
     Linux 删得掉，所以这里直接验"连接已关"这个因，顺带验文件能删（果）。
     """
     app = create_app(db_path=env["db"], ecdict_path=env["ecdict"])
@@ -1046,9 +1046,9 @@ def test_import_denies_cross_site_origin(client: TestClient, monkeypatch, origin
 
 
 def test_import_denies_cross_site_before_reading_any_body_byte():
-    """直捕 ASGI：拒绝发生在 await receive() 之前 —— 一个字节都没读。
+    """直捣 ASGI：拒绝发生在 await receive() 之前 —— 一个字节都没读。
 
-    TestClient 自己管 receive，验不了这件事；这里手搞 scope + 一个「被调用就
+    TestClient 自己管 receive，验不了这件事；这里手搛 scope + 一个「被调用就
     炸」的 receive，直接把中间件的承诺钉死。
     """
     import asyncio
