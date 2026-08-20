@@ -13,7 +13,9 @@ HTTP 壳子**（收 multipart、起线程、吐作业状态）。这样合并策
 
 失败口径（验收 §5）：任何一步失败都 rmtree 掉本次 uuid 目录、不留半条 Content。
 uuid 目录是这次导入新建的，所以"不覆盖已有文件"是天然成立的——
-唯一能撞车的是 (title, season_ep) 重复，那个在入库前显式拒绝。
+唯一能撞车的是 (title, season_ep) 重复：入库走 create_only（裸 INSERT，撞唯一索引
+就失败回滚），并发的两个同名导入因此必定一成一败，败的那个连媒体目录一起清掉，
+库里不会出现"后者覆盖前者 + 前者媒体成孤儿"（工单 17-2）。
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from app.consts import (
     LIBRARY_META,
     UPLOAD_CHUNK,
 )
-from app.ingest import ingest_srt, load_boxes, parse_srt_file
+from app.ingest import ContentExists, ingest_srt, load_boxes, parse_srt_file
 
 FFPROBE = "ffprobe"
 FFMPEG = "ffmpeg"
@@ -453,7 +455,14 @@ def run_import(
             media = video_path
             final = vinfo
 
-        # --- 3. 入库（原子） -----------------------------------------------
+        # --- 3. 入库（原子：只新增，不覆盖） --------------------------------
+        # 先 SELECT 再 INSERT 挡不住并发：两个同名导入可以同时看到"不存在"，
+        # 然后一起往下走，后到的那个把先到的 Content 覆盖掉、把它的媒体目录
+        # 变成没人引用的孤儿（工单 17-2）。所以这里的仲裁交给唯一索引：
+        # create_only=True → 裸 INSERT，撞 UNIQUE(title, season_ep) 就抛
+        # ContentExists，整个事务回滚，本次 uuid 目录随失败路径一起删掉。
+        # 下面这次 content_exists 只是为了给用户一句人话（"已经导入过"），
+        # 不是防线 —— 防线是 INSERT 本身。
         job.set(stage=STAGE_INGESTING, progress=0.0)
         conn = conn_factory()
         dup = content_exists(conn, job.title, job.season_ep)
@@ -462,15 +471,23 @@ def run_import(
                 f"《{job.title}》{job.season_ep} 已经在库里了（content_id={dup}），"
                 "不覆盖已有内容"
             )
-        stats = ingest_srt(
-            db_path=db_path,
-            srt_path=srt_path,
-            title=job.title,
-            season_ep=job.season_ep,
-            video_path=str(media),
-            conn=conn,
-            boxes_path=boxes_path,
-        )
+        try:
+            stats = ingest_srt(
+                db_path=db_path,
+                srt_path=srt_path,
+                title=job.title,
+                season_ep=job.season_ep,
+                video_path=str(media),
+                conn=conn,
+                boxes_path=boxes_path,
+                create_only=True,
+            )
+        except ContentExists as exc:
+            # 走到这儿 = 上面那次 SELECT 之后、INSERT 之前被人抢先了（并发同名导入）
+            raise ImportError_(
+                f"《{job.title}》{job.season_ep} 已经在库里了（同名导入撞车，"
+                "本次作业让位），不覆盖已有内容"
+            ) from exc
         # 过了这条线就不许再删媒体了：库里已经有一条指着它的 Content，
         # 后面哪一步出岔子也只是"元数据没写全"，不是"导入失败"。
         ingested = True
