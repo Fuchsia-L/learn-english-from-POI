@@ -500,51 +500,35 @@ def test_deepseek_model_override_reaches_transport():
     assert seen[0]["thinking"] == {"type": "disabled"}
 
 
-def test_deepseek_price_table_is_cache_miss(monkeypatch):
-    """官方人民币牌价（工单 17-4 修正）：命中 ¥0.02 / 未命中 ¥1 / 输出 ¥2，无峰谷。"""
+def test_deepseek_price_table_is_peak_cache_miss():
+    """估价口径：峰时 + cache-miss（牌价最贵那档）——预算是硬顶，不许乐观估。"""
     import app.providers.deepseek as DS
 
-    assert DS.PRICE_IN_HIT_CNY_PER_MTOK == 0.02
-    assert DS.PRICE_IN_MISS_CNY_PER_MTOK == 1.0
-    assert DS.PRICE_OUT_CNY_PER_MTOK == 2.0
-    assert DS.REFERENCE_PRICES_CNY_PER_MTOK == {"in_miss": 1.0, "in_hit": 0.02, "out": 2.0}
-
+    # 官方人民币牌价 2026-08（元 / 百万 token）
+    assert DS.PRICE_IN_MISS_PEAK_CNY_PER_MTOK == 3.0
+    assert DS.PRICE_OUT_PEAK_CNY_PER_MTOK == 9.0
+    # 错峰 = 峰价减半；缓存命中 ¥0.10（错峰再减半）
+    assert DS.PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK == 1.5
+    assert DS.PRICE_OUT_OFFPEAK_CNY_PER_MTOK == 4.5
+    assert DS.PRICE_IN_HIT_PEAK_CNY_PER_MTOK == 0.10
+    assert DS.PRICE_IN_HIT_OFFPEAK_CNY_PER_MTOK == 0.05
+    # 峰时窗口：北京时间 9–12 点与 14–18 点
+    assert DS.PEAK_HOURS_BEIJING == ((9, 12), (14, 18))
     p = get_provider("deepseek")
-    # 估价用的就是 cache-miss 输入 + 输出这两个数，不掺汇率、不打折
-    assert p.price_in_cny_per_mtok == DS.PRICE_IN_MISS_CNY_PER_MTOK
-    assert p.price_out_cny_per_mtok == DS.PRICE_OUT_CNY_PER_MTOK
-    # 命中缓存比估价便宜：估价确实是上界
-    assert DS.PRICE_IN_HIT_CNY_PER_MTOK < p.price_in_cny_per_mtok
-
-
-def test_deepseek_price_table_has_no_peak_window_anymore():
-    """DeepSeek 没有峰时/错峰档：那套常量和时段叙述都不许再出现（工单 17-4）。"""
-    import app.providers.deepseek as DS
-
-    for gone in (
-        "PRICE_IN_MISS_PEAK_CNY_PER_MTOK",
-        "PRICE_OUT_PEAK_CNY_PER_MTOK",
-        "PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK",
-        "PRICE_OUT_OFFPEAK_CNY_PER_MTOK",
-        "PRICE_IN_HIT_PEAK_CNY_PER_MTOK",
-        "PRICE_IN_HIT_OFFPEAK_CNY_PER_MTOK",
-        "PEAK_HOURS_BEIJING",
-    ):
-        assert not hasattr(DS, gone), f"{gone} 是错价目的残留，该删"
-    # 连叙述都不许留：模块里再没有"峰时/错峰/北京时间"这类时段档位的说法
-    src = Path(DS.__file__).read_text(encoding="utf-8")
-    for word in ("峰时", "错峰", "峰价", "北京时间"):
-        assert word not in src, f"价目叙述里还留着「{word}」"
+    # 类上用的就是峰时 cache-miss 那两个数，不掺汇率、不打折
+    assert p.price_in_cny_per_mtok == DS.PRICE_IN_MISS_PEAK_CNY_PER_MTOK
+    assert p.price_out_cny_per_mtok == DS.PRICE_OUT_PEAK_CNY_PER_MTOK
+    # 错峰/命中缓存都比估价便宜：估价确实是上界
+    assert DS.PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK < p.price_in_cny_per_mtok
+    assert DS.PRICE_IN_HIT_PEAK_CNY_PER_MTOK < p.price_in_cny_per_mtok
+    assert DS.PRICE_OUT_OFFPEAK_CNY_PER_MTOK < p.price_out_cny_per_mtok
 
 
 def test_deepseek_estimate_is_sane_per_word():
-    """一批 4 词（默认 batch）每词约 ¥0.001；离线可算，不发请求。
-
-    比工单 17-4 之前便宜了一截 —— 那时按错的 ¥3/¥9 估，现在按 ¥1/¥2。
-    """
+    """一批 4 词（默认 batch）每词约 ¥0.004；离线可算，不发请求。"""
     batch = [{**ITEM, "id": str(i)} for i in range(4)]
     per_word = get_provider("deepseek").estimate_cost(batch) / 4
-    assert 0.0005 < per_word < 0.002
+    assert 0.002 < per_word < 0.008
 
 
 # --- 工单 16-2：牌价 = 带元数据的结构 + 可覆盖 + 非法即 fail closed ---------
@@ -571,13 +555,13 @@ def test_price_values_unchanged_by_the_refactor():
     import app.providers.anthropic_api as AN
     import app.providers.deepseek as DS
 
-    assert (DS.PRICE.input_per_mtok, DS.PRICE.output_per_mtok) == (1.0, 2.0)
-    assert DS.PRICE.as_of == "2026-08-19"
+    assert (DS.PRICE.input_per_mtok, DS.PRICE.output_per_mtok) == (3.0, 9.0)
+    assert DS.PRICE.as_of == "2026-08-20"
     assert (AN.PRICE.input_per_mtok, AN.PRICE.output_per_mtok) == (7.2, 36.0)
     # Anthropic 那两个数是美元牌价折算的粗估、没核过现价：as_of 就得说实话
     assert "unverified" in AN.PRICE.as_of and "非" in AN.PRICE.source
     # 老名字仍然可用（README / 外部代码引用的是它们）
-    assert get_provider("deepseek").price_in_cny_per_mtok == 1.0
+    assert get_provider("deepseek").price_in_cny_per_mtok == 3.0
     assert get_provider("anthropic").price_out_cny_per_mtok == 36.0
 
 
@@ -585,10 +569,10 @@ def test_estimate_cost_carries_as_of_but_is_still_a_float():
     """估价结果自带 as_of 标注，同时对老调用方完全是个 float。"""
     est = get_provider("deepseek").estimate_cost(BATCH)
     assert isinstance(est, float) and est > 0
-    assert est.as_of == "2026-08-19"
+    assert est.as_of == "2026-08-20"
     assert est.price.currency == "CNY"
-    assert "as_of=2026-08-19" in est.label()
-    assert "as_of=2026-08-19" in repr(est)
+    assert "as_of=2026-08-20" in est.label()
+    assert "as_of=2026-08-20" in repr(est)
     # 预算比较 / 取整 / 格式化 一律照旧
     assert round(est, 4) == round(float(est), 4)
     assert (est > 999.0) is False and f"{est:.4f}".count(".") == 1
@@ -597,29 +581,29 @@ def test_estimate_cost_carries_as_of_but_is_still_a_float():
 
 def test_price_label_shows_source_and_as_of():
     label = get_provider("deepseek").price_label()
-    assert "¥1" in label and "¥2" in label
-    assert "as_of=2026-08-19" in label and "official price page" in label
-    assert get_provider("deepseek").resolved_price().stamp() == "牌价 as_of=2026-08-19"
+    assert "¥3" in label and "¥9" in label
+    assert "as_of=2026-08-20" in label and "official price page" in label
+    assert get_provider("deepseek").resolved_price().stamp() == "牌价 as_of=2026-08-20"
 
 
 def test_price_env_override_changes_the_estimate(monkeypatch):
     """牌价变了不必改代码：POI_DEEPSEEK_PRICE_IN/OUT 直接覆盖（元 / 百万 token）。"""
     base = get_provider("deepseek").estimate_cost(BATCH)
-    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "10")
-    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "20")
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_IN", "30")
+    monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "90")
     p = get_provider("deepseek")
-    assert p.price_in_cny_per_mtok == 10.0 and p.price_out_cny_per_mtok == 20.0
+    assert p.price_in_cny_per_mtok == 30.0 and p.price_out_cny_per_mtok == 90.0
     est = p.estimate_cost(BATCH)
     assert est == pytest.approx(float(base) * 10, rel=1e-3)
     # 覆盖后 as_of / source 要说清"这不是表里那份"
-    assert "env-override" in est.as_of and "2026-08-19" in est.as_of
+    assert "env-override" in est.as_of and "2026-08-20" in est.as_of
     assert "POI_DEEPSEEK_PRICE_IN+POI_DEEPSEEK_PRICE_OUT" in est.price.source
 
 
 def test_price_env_override_can_be_partial(monkeypatch):
     monkeypatch.setenv("POI_DEEPSEEK_PRICE_OUT", "1.5")
     price = get_provider("deepseek").resolved_price()
-    assert price.input_per_mtok == 1.0 and price.output_per_mtok == 1.5
+    assert price.input_per_mtok == 3.0 and price.output_per_mtok == 1.5
     assert "POI_DEEPSEEK_PRICE_OUT" in price.source
     assert "POI_DEEPSEEK_PRICE_IN+" not in price.source
 
@@ -658,7 +642,7 @@ def test_each_provider_reads_its_own_env_prefix(monkeypatch):
     monkeypatch.delenv("POI_DEEPSEEK_PRICE_IN")
     monkeypatch.setenv("POI_ANTHROPIC_PRICE_IN", "99")
     assert get_provider("anthropic").price_in_cny_per_mtok == 99.0
-    assert get_provider("deepseek").price_in_cny_per_mtok == 1.0
+    assert get_provider("deepseek").price_in_cny_per_mtok == 3.0
 
 
 def test_provider_without_price_fails_closed():
@@ -681,7 +665,7 @@ def test_legacy_float_price_attributes_still_work():
 
     class Structured(ChatJSONProvider):
         name = "structured"
-        price = Price(3.0, 9.0, as_of="2026-08-16")
+        price = Price(3.0, 9.0, as_of="2026-08-20")
 
     est = Legacy().estimate_cost(BATCH)
     assert est == pytest.approx(float(Structured().estimate_cost(BATCH)))
