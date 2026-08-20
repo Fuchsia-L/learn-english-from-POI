@@ -1046,9 +1046,9 @@ def test_import_denies_cross_site_origin(client: TestClient, monkeypatch, origin
 
 
 def test_import_denies_cross_site_before_reading_any_body_byte():
-    """直捣 ASGI：拒绝发生在 await receive() 之前 —— 一个字节都没读。
+    """直捅 ASGI：拒绝发生在 await receive() 之前 —— 一个字节都没读。
 
-    TestClient 自己管 receive，验不了这件事；这里手搛 scope + 一个「被调用就
+    TestClient 自己管 receive，验不了这件事；这里手搓 scope + 一个「被调用就
     炸」的 receive，直接把中间件的承诺钉死。
     """
     import asyncio
