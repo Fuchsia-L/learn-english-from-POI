@@ -222,7 +222,7 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
   就是坏了，不确定成本时一分钱都不许花。绝不再按 ¥0 继续跑。
 - 免责标签由**代码**兜底，不指望模型自觉：`morph` 拆分永远标"未经词源核验"，
   其余 hook 一律带"非词源"。没有事实区（DESIGN §5：`factual` 已处决）。
-- 单任务失败、provider 抛任何异常、落库出错都不会掸翻 worker。
+- 单任务失败、provider 抛任何异常、落库出错都不会掀翻 worker。
 
 ### 调提示词
 
