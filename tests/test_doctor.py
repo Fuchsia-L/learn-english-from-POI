@@ -823,3 +823,217 @@ def test_doctor_does_not_create_a_missing_database(tmp_path: Path, capsys):
     capsys.readouterr()
     assert rc == 1
     assert not missing.exists()
+
+
+# --- 12. v1 老库：只报告，不迁移，不 traceback（工单 17-3） -----------------
+# 下面这份 DDL 是**真的 v1**：从 git 412db51（工单 9 时期，SCHEMA_VERSION = 1）
+# 里逐字取出来的建表脚本 —— Encounter 那时还是 segment_id NOT NULL、没有
+# source_kind / context_json。用户手上跑了半年的 data/poi-ocr.db 就长这样。
+V1_SCHEMA = """
+-- 1. 一集（或一个片段）的媒体 + 字幕来源
+CREATE TABLE IF NOT EXISTS Content (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    season_ep   TEXT NOT NULL,
+    video_path  TEXT,
+    srt_path    TEXT,
+    UNIQUE (title, season_ep)
+);
+
+-- 2. 字幕段。tokens_json 供 GET /segments 直接吐给前端；
+--    word_boxes_json 由 extract_hardsub.py 的词级包围盒回填（§4 热区）。
+CREATE TABLE IF NOT EXISTS Segment (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id      INTEGER NOT NULL REFERENCES Content(id) ON DELETE CASCADE,
+    idx             INTEGER NOT NULL,
+    t_start         REAL NOT NULL,
+    t_end           REAL NOT NULL,
+    text_en         TEXT NOT NULL,
+    tokens_json     TEXT,
+    word_boxes_json TEXT,
+    UNIQUE (content_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_segment_content_time
+    ON Segment (content_id, t_start);
+
+-- 3. 客观词典条目缓存（来自 ECDICT），与用户行为无关
+CREATE TABLE IF NOT EXISTS Lexeme (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lemma       TEXT NOT NULL UNIQUE,
+    pos         TEXT,
+    ipa         TEXT,
+    dict_gloss  TEXT
+);
+
+-- 4. surface -> lexeme 映射；surface 统一小写
+CREATE TABLE IF NOT EXISTS WordForm (
+    surface     TEXT PRIMARY KEY,
+    lexeme_id   INTEGER NOT NULL REFERENCES Lexeme(id) ON DELETE CASCADE,
+    note        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wordform_lexeme ON WordForm (lexeme_id);
+
+-- 5. 用户收藏了什么
+CREATE TABLE IF NOT EXISTS VocabEntry (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lexeme_id   INTEGER NOT NULL UNIQUE REFERENCES Lexeme(id) ON DELETE CASCADE,
+    added_at    TEXT NOT NULL,
+    note        TEXT
+);
+
+-- 6. 每次真实语境下的相遇
+CREATE TABLE IF NOT EXISTS Encounter (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    vocab_entry_id  INTEGER NOT NULL REFERENCES VocabEntry(id) ON DELETE CASCADE,
+    segment_id      INTEGER NOT NULL REFERENCES Segment(id) ON DELETE CASCADE,
+    surface         TEXT NOT NULL,
+    added_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_encounter_vocab ON Encounter (vocab_entry_id);
+
+-- 7. 异步助记任务队列（与收藏解耦）
+CREATE TABLE IF NOT EXISTS AnnotationJob (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lexeme_id   INTEGER NOT NULL REFERENCES Lexeme(id) ON DELETE CASCADE,
+    status      TEXT NOT NULL DEFAULT 'queued'
+                CHECK (status IN ('queued', 'running', 'done', 'failed')),
+    priority    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    done_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_pick ON AnnotationJob (status, priority DESC, id);
+CREATE INDEX IF NOT EXISTS idx_job_lexeme ON AnnotationJob (lexeme_id);
+
+-- 8. 助记卡（按 lexeme 缓存 + 版本化）
+CREATE TABLE IF NOT EXISTS Mnemonic (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lexeme_id       INTEGER NOT NULL REFERENCES Lexeme(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    provider        TEXT,
+    version         INTEGER NOT NULL DEFAULT 1,
+    edited_by_user  INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (lexeme_id, kind, version)
+);
+
+-- 9. 复习记录（M1 才写，表先建好）
+CREATE TABLE IF NOT EXISTS Review (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    vocab_entry_id  INTEGER NOT NULL REFERENCES VocabEntry(id) ON DELETE CASCADE,
+    at              TEXT NOT NULL,
+    result          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_entry ON Review (vocab_entry_id, at);
+"""
+
+V1_USER_VERSION = 1
+
+
+def make_v1_db(tmp_path: Path, name: str = "poi_v1.db", rows: bool = True) -> Path:
+    """按真实 v1 DDL 建一个老库，塞点数据（含一条 Encounter）。绝不调用 init_db。"""
+    db = tmp_path / name
+    conn = sqlite3.connect(str(db))
+    conn.executescript(V1_SCHEMA)
+    conn.execute(f"PRAGMA user_version = {V1_USER_VERSION}")
+    if rows:
+        conn.execute(
+            "INSERT INTO Content (id, title, season_ep, video_path, srt_path) "
+            "VALUES (1, 'Fixture Show', 's01e01', NULL, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO Segment (id, content_id, idx, t_start, t_end, text_en, tokens_json) "
+            "VALUES (1, 1, 1, 1.0, 4.0, ?, ?)",
+            (
+                LINES[0],
+                json.dumps(
+                    [{"surface": "the", "lemma": "the", "char_start": 0, "char_end": 3}]
+                ),
+            ),
+        )
+        conn.execute("INSERT INTO Lexeme (id, lemma) VALUES (1, 'gardener')")
+        conn.execute(
+            "INSERT INTO VocabEntry (id, lexeme_id, added_at) VALUES (1, 1, '2026-08-01T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO Encounter (id, vocab_entry_id, segment_id, surface, added_at) "
+            "VALUES (1, 1, 1, 'gardener', '2026-08-01T00:00:00+00:00')"
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_v1_db_has_no_source_kind_column(tmp_path: Path):
+    """夹具自检：这确实是一个 v1 库（不是 init_db 建的 v2）。"""
+    db = make_v1_db(tmp_path)
+    conn = raw_conn(db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(Encounter)")}
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert "source_kind" not in cols and "context_json" not in cols
+    assert ver == V1_USER_VERSION and V1_USER_VERSION != D.SCHEMA_VERSION
+
+
+def test_v1_db_is_reported_not_crashed(tmp_path: Path):
+    """真实 v1 库：给出人话报告 + ✗，绝不 traceback（以前这里是 no such column）。"""
+    db = make_v1_db(tmp_path)
+    report = run(db, tmp_path)          # 抛异常的话这一行就炸了 —— 那正是回归点
+    msg = messages(report)
+    assert "老库" in msg and "Encounter" in msg
+    assert "source_kind" in msg and "context_json" in msg
+    assert "只读" in msg and "不会替你迁移" in msg
+    assert "app.db import init_db" in msg or "uvicorn" in msg   # 怎么迁写清楚了
+    assert report.verdict == D.FAIL
+    assert report.data["schema"]["needs_migration"] is True
+    assert report.data["schema"]["encounter_missing"] == ["source_kind", "context_json"]
+
+
+def test_v1_db_exits_nonzero(tmp_path: Path, capsys):
+    """`python -m app.doctor --db 老库` 退出码非零，输出里没有 Traceback。"""
+    db = make_v1_db(tmp_path)
+    rc = D.main(["--db", str(db), "--no-ffprobe", "--ecdict", str(mini_ecdict(tmp_path))])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "Traceback" not in out and "no such column" not in out
+    assert "老库" in out
+
+
+def test_v1_db_skips_v2_dependent_summary(tmp_path: Path):
+    """依赖 v2 列的那条汇总检查被跳过并说明了 —— 不是偷偷不查。"""
+    db = make_v1_db(tmp_path)
+    report = run(db, tmp_path)
+    skipped = [f for f in report.findings if f.data.get("skipped") == "encounter_context_json"]
+    assert len(skipped) == 1 and skipped[0].level == D.WARN
+    assert "跳过" in skipped[0].message
+    # 与 Encounter 无关的检查照常出结果（行数、外键、时间轴）
+    assert report.data["counts"]["Encounter"] == 1
+    assert "orphans" in report.data
+
+
+def test_v1_db_is_not_migrated_by_doctor(tmp_path: Path, capsys):
+    """只读硬约束：体检完，库还是 v1，字节都没变。"""
+    db = make_v1_db(tmp_path)
+    before = digest(db)
+    D.main(["--db", str(db), "--no-ffprobe", "--ecdict", str(mini_ecdict(tmp_path))])
+    capsys.readouterr()
+    conn = raw_conn(db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(Encounter)")}
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert "source_kind" not in cols          # 没被顺手迁走
+    assert ver == V1_USER_VERSION
+    assert digest(db) == before               # 主文件逐字节不变（含 mtime）
+
+
+def test_v2_db_with_stale_user_version_is_only_a_warning(tmp_path: Path):
+    """表结构已经是 v2、只是版本号没盖上：⚠ 而不是 ✗（还能用）。"""
+    db = make_db(tmp_path, boxed_idx={1})
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+    report = run(db, tmp_path)
+    assert report.data["schema"]["needs_migration"] is False
+    warn = messages(report, D.WARN)
+    assert "user_version=1" in warn and "版本号没盖上" in warn
+    assert report.verdict == D.WARN
