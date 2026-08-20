@@ -692,7 +692,7 @@ def test_no_socket_usage(client: TestClient, env: dict, monkeypatch):
 def test_lifespan_closes_every_thread_connection(env: dict):
     """TestClient 退出后：两个库的所有连接（含线程池里那些）必须已经关掉。
 
-    Windows 上没关的连接会锁住 .db 文件，用户删不掉也重建不了词典。
+    Windows 上没关的连接会锁住 .db 文件，用户删不掉也重建不了。
     Linux 删得掉，所以这里直接验"连接已关"这个因，顺带验文件能删（果）。
     """
     app = create_app(db_path=env["db"], ecdict_path=env["ecdict"])
@@ -989,3 +989,169 @@ def test_no_cors_headers_without_origin(client: TestClient):
     r = client.get("/lookup", params={"surface": "home"})
     assert "access-control-allow-origin" not in r.headers
     assert "vary" not in r.headers
+
+
+# --- 跨站写入拦截：POST /import 只认本机 Origin（工单 17-1） ----------------
+# 背景：multipart/form-data 是 CORS 的「简单请求」，浏览器不预检、直接发。
+# 「没给 CORS 响应头」只挡住了读回包，挡不住写 —— 所以 /import 自己认 Origin。
+
+# 上传三件套：内容随便，反正合法请求也走不到解析这一步就该被拒
+def _import_files() -> dict:
+    return {
+        "video": ("ep.mp4", b"\x00" * 4096, "video/mp4"),
+        "srt": ("ep.srt", FIXTURE_SRT.encode("utf-8"), "text/plain"),
+    }
+
+
+def _import_form() -> dict:
+    return {"title": "Test Show", "season_ep": "s09e09"}
+
+
+def _library_dirs(env: dict) -> list[Path]:
+    lib_root = Path(env["db"]).parent / "library"
+    return sorted(p for p in lib_root.iterdir()) if lib_root.is_dir() else []
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "http://evil.example",
+        "https://localhost.evil.example",   # 后缀骗子
+        "http://127.0.0.1.evil.example",    # 前缀骗子
+        "null",                             # sandbox iframe / file:// 的不透明 origin
+        "chrome-extension://abcdefghijklmnopabcdefghijklmnop",  # 插件也不许导入
+        "http://[::1]:8000@evil.example",
+    ],
+)
+def test_import_denies_cross_site_origin(client: TestClient, monkeypatch, origin: str):
+    """外站 / null / 插件 origin 一律 403，且磁盘和作业表干干净净。"""
+    import app.library as lib
+
+    def _boom(*a, **kw):  # 走到落盘就说明拦晚了
+        raise AssertionError("拦截失败：上传内容已经开始落盘")
+
+    monkeypatch.setattr(lib, "save_upload", _boom)
+    monkeypatch.setattr(lib, "new_work_dir", _boom)
+
+    r = client.post(
+        "/import", data=_import_form(), files=_import_files(), headers={"Origin": origin}
+    )
+    assert r.status_code == 403
+    assert "跨站" in r.json()["detail"]
+    assert "access-control-allow-origin" not in r.headers   # 顺带：也别把回包给他
+    # 没建 uuid 目录、没登记作业
+    assert _library_dirs(client.env) == []                  # type: ignore[attr-defined]
+    assert client.get("/import").json() == {"count": 0, "jobs": []}
+
+
+def test_import_denies_cross_site_before_reading_any_body_byte():
+    """直捕 ASGI：拒绝发生在 await receive() 之前 —— 一个字节都没读。
+
+    TestClient 自己管 receive，验不了这件事；这里手搞 scope + 一个「被调用就
+    炸」的 receive，直接把中间件的承诺钉死。
+    """
+    import asyncio
+    import threading
+
+    app = create_app(db_path="/nonexistent/never-touched.db")
+    received: list[str] = []
+
+    async def receive():
+        received.append("read")
+        raise AssertionError("拦截失败：中间件读了请求体")
+
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/import",
+        "raw_path": b"/import",
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "headers": [
+            (b"host", b"127.0.0.1:8000"),
+            (b"origin", b"https://evil.example"),
+            (b"content-type", b"multipart/form-data; boundary=x"),
+            (b"content-length", b"999999999"),
+        ],
+        "client": ("127.0.0.1", 54321),
+        "server": ("127.0.0.1", 8000),
+    }
+    # 单起一个线程跑：同一进程里如果有别的用例开着 playwright 的同步 API，
+    # 本线程会挂着一个运行中的事件循环，asyncio.run 就没法用了。
+    box: dict[str, BaseException] = {}
+
+    def drive() -> None:
+        try:
+            asyncio.run(app(scope, receive, send))
+        except BaseException as exc:  # noqa: BLE001 —— 原样搬回主线程再抛
+            box["err"] = exc
+
+    t = threading.Thread(target=drive)
+    t.start()
+    t.join(timeout=30)
+    assert not t.is_alive(), "中间件卡住了"
+    if "err" in box:
+        raise box["err"]
+
+    assert received == []                                   # receive() 从没被 await
+    assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 403
+    assert b"\xe8\xb7\xa8\xe7\xab\x99" in sent[1]["body"]   # "跨站"（UTF-8）
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1",
+        "https://localhost:8443",
+        "http://[::1]:8000",
+        "HTTP://LOCALHOST:8000",   # 大小写不敏感
+    ],
+)
+def test_import_allows_local_page_origin(client: TestClient, origin: str):
+    """播放器自己的「内容库」界面（本机 origin）照常放行 —— 过了闸交给路由校验。"""
+    r = client.post(
+        "/import",
+        data={"title": " ", "season_ep": " "},   # 空白标题：故意让路由以 400 拒绝
+        files=_import_files(),
+        headers={"Origin": origin},
+    )
+    assert r.status_code == 400                  # 不是 403：说明闸放行了
+    assert "不能为空" in r.json()["detail"]
+    assert _library_dirs(client.env) == []       # type: ignore[attr-defined]
+
+
+def test_import_allows_cli_without_origin(client: TestClient):
+    """本机 CLI（curl / 脚本）不带 Origin：放行。浏览器发跨站请求一定带 Origin。"""
+    r = client.post(
+        "/import", data={"title": "Test Show", "season_ep": " "}, files=_import_files()
+    )
+    assert r.status_code == 400 and "不能为空" in r.json()["detail"]
+
+
+def test_import_guard_does_not_block_reads(client: TestClient):
+    """闸只管写：GET /import（看最近几次导入）不拦 —— 它本来就没有 CORS 许可。"""
+    r = client.get("/import", headers={"Origin": "https://evil.example"})
+    assert r.status_code == 200
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_import_duplicate_check_still_wins_for_local_origin(client: TestClient):
+    """闸不改原有语义：本机 origin 的重复导入还是 409。"""
+    r = client.post(
+        "/import",
+        data={"title": "Test Show", "season_ep": "s01e01"},   # env 夹具已经导过这集
+        files=_import_files(),
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert r.status_code == 409 and "已经导入过" in r.json()["detail"]
