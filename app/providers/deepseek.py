@@ -37,32 +37,23 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 # deepseek-v4-flash 的官网人民币价目，单位都是 **元 / 百万 token**。官网直接标
 # 人民币，所以这里不再走"美元 × 汇率"那一道（少一个会漂的估计量）。
 #
-#   峰时（保守上界，**估价只认这两个数**）：
-#       输入 cache-miss  ¥3.00     输出  ¥9.00
-#   下面这些只作记录，**不参与估算**：
-#       错峰：峰价减半（输入 cache-miss ¥1.50 / 输出 ¥4.50）
-#       缓存命中：¥0.10（错峰再减半 ¥0.05）
+#   输入（缓存未命中）  ¥1.00      ← 估价用（保守上界）
+#   输出                ¥2.00      ← 估价用
+#   输入（缓存命中）    ¥0.02      只作记录，不参与估算
 #
-# 峰时 = **北京时间 09:00–12:00 与 14:00–18:00**，其余时段按错峰计。
-PRICE_SOURCE = "official price page (api-docs.deepseek.com/quick_start/pricing)"
-PRICE_AS_OF = "2026-08-16"  # 抄下这组数的日期。牌价是**某一天的**，不是常识。
-PRICE_NOTE = "估算用，以官方现价为准（峰时 + cache-miss，最贵那档）"
+# **不分时段**：官方价目页就这三个数，没有时段档位、没有时段折扣。以前这里按
+# 两档时段价写的 ¥3 / ¥9 和那段时段窗口叙述都是错的，已删（工单 17-4）。
+PRICE_SOURCE = "official price page (api-docs.deepseek.com/zh-cn/quick_start/pricing/)"
+PRICE_AS_OF = "2026-08-19"  # 抄下这组数的日期。牌价是**某一天的**，不是常识。
+PRICE_NOTE = "估算用，以官方现价为准（按 cache-miss 输入计，最贵那档）"
 
-PRICE_IN_MISS_PEAK_CNY_PER_MTOK = 3.0     # 输入 cache-miss，峰时 —— 估价用
-PRICE_OUT_PEAK_CNY_PER_MTOK = 9.0         # 输出，峰时 —— 估价用
-# 以下四个常量仅供查阅/对账，估价一律不用（见下面的口径说明）
-PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK = 1.5  # 输入 cache-miss，错峰（峰价减半）
-PRICE_IN_HIT_PEAK_CNY_PER_MTOK = 0.10     # 输入 cache-hit，峰时
-PRICE_IN_HIT_OFFPEAK_CNY_PER_MTOK = 0.05  # 输入 cache-hit，错峰
-PRICE_OUT_OFFPEAK_CNY_PER_MTOK = 4.5      # 输出，错峰（峰价减半）
+PRICE_IN_MISS_CNY_PER_MTOK = 1.0   # 输入 cache-miss —— 估价用
+PRICE_OUT_CNY_PER_MTOK = 2.0       # 输出 —— 估价用
+PRICE_IN_HIT_CNY_PER_MTOK = 0.02   # 输入 cache-hit，仅供查阅/对账，估价不用
 
-# 峰时窗口（北京时间），只用于文档/日志说明，不参与计算。
-PEAK_HOURS_BEIJING = ((9, 12), (14, 18))
-
-# 估价口径（硬规矩）：一律按 **峰时 + cache-miss** 算，即牌价里最贵的那一档。
-# 预算是硬顶不是期望值——错峰/命中缓存省下来的钱算意外之喜，不许提前花掉。
-PRICE_IN_CNY_PER_MTOK = PRICE_IN_MISS_PEAK_CNY_PER_MTOK
-PRICE_OUT_CNY_PER_MTOK = PRICE_OUT_PEAK_CNY_PER_MTOK
+# 估价口径（硬规矩）：输入一律按 **cache-miss** 算，即牌价里贵的那一档。
+# 预算是硬顶不是期望值——命中缓存省下来的钱算意外之喜，不许提前花掉。
+PRICE_IN_CNY_PER_MTOK = PRICE_IN_MISS_CNY_PER_MTOK
 
 # 估价真正认的那一份（工单 16-2：单价 + 币种 + 来源 + as_of + 备注 打成一个结构）。
 PRICE = Price(
@@ -74,14 +65,11 @@ PRICE = Price(
     note=PRICE_NOTE,
 )
 
-# 其它档位只作对账，估价一律不用（保守原则：只按最贵那档估）。
+# 缓存命中那档只作对账，估价一律不用（保守原则：只按贵的那档估）。
 REFERENCE_PRICES_CNY_PER_MTOK = {
-    "in_miss_peak": PRICE_IN_MISS_PEAK_CNY_PER_MTOK,
-    "in_miss_offpeak": PRICE_IN_MISS_OFFPEAK_CNY_PER_MTOK,
-    "in_hit_peak": PRICE_IN_HIT_PEAK_CNY_PER_MTOK,
-    "in_hit_offpeak": PRICE_IN_HIT_OFFPEAK_CNY_PER_MTOK,
-    "out_peak": PRICE_OUT_PEAK_CNY_PER_MTOK,
-    "out_offpeak": PRICE_OUT_OFFPEAK_CNY_PER_MTOK,
+    "in_miss": PRICE_IN_MISS_CNY_PER_MTOK,
+    "in_hit": PRICE_IN_HIT_CNY_PER_MTOK,
+    "out": PRICE_OUT_CNY_PER_MTOK,
 }
 
 # 环境变量覆盖（工单 16-2）：牌价变了又懒得改代码时，
@@ -106,7 +94,7 @@ class DeepSeekProvider(ChatJSONProvider):
     endpoint = "https://api.deepseek.com/chat/completions"
     model = DEFAULT_MODEL
 
-    # 官方人民币牌价（峰时 cache-miss）+ 它的来源/日期；可被环境变量覆盖。
+    # 官方人民币牌价（cache-miss 输入 + 输出）+ 它的来源/日期；可被环境变量覆盖。
     price = PRICE
     price_env_prefix = PRICE_ENV_PREFIX
     out_tokens_per_item = OUT_TOKENS_PER_ITEM
