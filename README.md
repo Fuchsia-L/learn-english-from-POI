@@ -234,20 +234,20 @@ python -m app.annotate --db data/poi.db --ecdict data/ecdict.db \
 system + user prompt。
 
 价目表写在各 provider 模块顶部的常量里（`app/providers/deepseek.py` 是
-`PRICE_*_CNY_PER_MTOK` 一组**官方人民币牌价，`PRICE_AS_OF = 2026-08-19`**，直接给到
+`PRICE_*_CNY_PER_MTOK` 一组**官方人民币牌价，`PRICE_AS_OF = 2026-08-20`**，直接给到
 类上的 `price_in_cny_per_mtok` / `price_out_cny_per_mtok`——**变价改这一处**），
 **随时可能过期，自己核对官网后改**。deepseek-v4-flash（元 / 百万 token）：
-输入缓存未命中 **¥1**、输出 **¥2**（估价用这两个）；输入缓存命中 ¥0.02 只作注释备查，
-**不参与估算**（保守原则）。**没有分时段的峰谷价**——旧版 README 写的
-「峰时 ¥3/¥9、错峰减半、北京时间 9-12/14-18」是错的，官方价目页只有上面三个数
-（工单 17-4 已改；来源见 `PRICE_SOURCE`：api-docs.deepseek.com/zh-cn/quick_start/pricing/）。
+峰时输入（cache-miss）**¥3**、输出 **¥9**（估价只认这两个）；错峰减半
+（输入 ¥1.5 / 输出 ¥4.5）、缓存命中 ¥0.10（错峰再减半 ¥0.05）只作注释备查，
+**不参与估算**（保守原则）。峰时 = **北京时间 9:00–12:00 与 14:00–18:00**，
+其余时段按错峰计（来源见 `PRICE_SOURCE`）。
 
 DeepSeek 默认模型是 **`deepseek-v4-flash`**（旧的 `deepseek-chat` / `deepseek-reasoner`
 已被官方宣布退役）。该系列**默认开 thinking 且 effort=high**，助记生成用不上，
 请求体里已显式写死 `"thinking": {"type": "disabled"}`，不然要重度多计费。
 换模型用 `--model`（只对真 provider 有意义，`fake` 忽略）。
-估价一律按 **cache-miss 输入**（牌价里贵的那档）算 —— 预算是硬顶，不许乐观估。
-按默认 `--batch-size 4` 算下来约 **¥0.001/词**，¥4 预算够跑 ~4000 个词。
+估价一律按**峰时 + cache-miss**（牌价最贵那档）算 —— 预算是硬顶，不许乐观估。
+按默认 `--batch-size 4` 算下来约 **¥0.0039/词**，¥4 预算够跑 ~1000 个词。
 
 ## build_cet46：预热词表
 
