@@ -11,10 +11,13 @@ HTTP 壳子在 app/server.py（`/review/next`、`/review/answer`、`/review/stat
        know → stage + 1（封顶 GRADUATE_STAGE）；dont → stage 归 0。
 2. 到期日 next_due（UTC 日历日，日粒度）：
    - 从没复习过 → 收藏当天即到期（新收藏当天就能复习）；
-   - 最后一次答 know（stage = s ≥ 1）→ 最后一次复习那天 + INTERVALS[s-1]；
+   - 最后一次答 know（stage = s，1 ≤ s < GRADUATE_STAGE）→ 最后一次复习那天
+     + INTERVALS[s-1]（即答对第 1 次隔 1 天、第 2 次隔 3 天）；
    - 最后一次答 dont（stage = 0）→ 最后一次复习那天 + DONT_INTERVAL_DAYS（明天再来）。
-3. 毕业：stage 达到 GRADUATE_STAGE = 3（3 次封顶——原片里本来就会再遇见它两次，
+3. 毕业：stage 达到 GRADUATE_STAGE = 3（答对 3 次封顶——原片里本来就会再遇见它，
    不用把词卡在队列里刷到天荒地老）。毕业后不再进队（stats 里单独计数）。
+   所以生效的间隔只有 INTERVALS = (1, 3) 两档：第 3 次答对直接毕业，没有第三个
+   间隔可用（工单 17-5：以前多写的那个 7 天从来没生效过）。
 4. 进队（due）—— 三个条件全满足：还没毕业；next_due ≤ 今天；今天（UTC 日）
    还没复习过（ONCE_PER_DAY）。
 5. 排序：逾期最久的（next_due 最早）优先，其次从未复习过的优先，
@@ -39,10 +42,16 @@ from app.db import ENCOUNTER_SELECT, encounter_view
 
 # --- 规则常量（DESIGN §7：间隔重复简化版，FSRS 以后再说） ------------------
 
-# 答对之后隔多少天再问一遍：stage 1 → 1 天，stage 2 → 3 天，stage 3 → 毕业。
-# 想把封顶提到 4 次，就在这里续一个数（GRADUATE_STAGE 跟着长）。
-INTERVALS = (1, 3, 7)
-GRADUATE_STAGE = len(INTERVALS)  # stage 到这个档 = 毕业（3 次封顶）
+# 答对之后隔多少天再问一遍：stage 1 → 1 天，stage 2 → 3 天，答对第 3 次 → 毕业。
+#
+# **间隔表只需要 GRADUATE_STAGE - 1 个数**（工单 17-5）：最后一档答对即毕业，
+# 它的"下次到期"永远不会被用到。以前这里写 (1, 3, 7) 且 GRADUATE_STAGE = 3，
+# 于是 7 天那一档永远轮不到 —— "1/3/7 天 + 答对 3 次毕业"两句话不可能同时成立，
+# 界面和文档却照着念了一路。现在按实际生效的口径写：**1/3 天，3 次毕业**。
+# 想真用上 7 天，就把 INTERVALS 写成 (1, 3, 7) 并把 GRADUATE_STAGE 提到 4
+# （= 答对 4 次毕业），不能只加间隔不加毕业档。
+INTERVALS = (1, 3)
+GRADUATE_STAGE = 3  # stage 到这个档 = 毕业（答对 3 次封顶）
 DONT_INTERVAL_DAYS = 1  # 答"不会"：stage 归 0，明天再来
 ONCE_PER_DAY = True  # 同一 UTC 日已复习过的词，今天不再出现
 
@@ -66,7 +75,11 @@ def rules() -> dict[str, Any]:
 
 
 def interval_days(stage: int) -> int:
-    """stage → 距下次到期的天数。stage 0（刚答错/新词）走 DONT_INTERVAL_DAYS。"""
+    """stage → 距下次到期的天数。stage 0（刚答错/新词）走 DONT_INTERVAL_DAYS。
+
+    毕业档（stage == GRADUATE_STAGE）没有"下一次"，这里按最后一个间隔兜底返回一个
+    数只是为了让 next_due 有个值可填 —— 毕业的词不进队，那个日期没人看（见 due）。
+    """
     if stage <= 0:
         return DONT_INTERVAL_DAYS
     return INTERVALS[min(stage, len(INTERVALS)) - 1]
