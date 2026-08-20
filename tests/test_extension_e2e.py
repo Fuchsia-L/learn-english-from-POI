@@ -10,8 +10,13 @@
 
 版权红线（DESIGN §0 §6）：假页面上的英文全是自造句子，不含任何真实剧集台词。
 
-无头跑不通的兜底：句子扩取的纯函数层在 tests/test_extension_sentence.py 里
-用 node 单测覆盖，本文件整体 skip 也不会留下裸奔的逻辑。
+**skip 纪律（工单 17-6）**：本文件**只有一个**允许 skip 的理由 —— 机器上压根没装
+Playwright 的 chromium（executable 文件不存在）。除此之外一律 fail：浏览器在却起不来、
+manifest 不合法、内容脚本没注入，全是产品自己的问题，不许伪装成"环境问题"跳过去
+（跳过去的结果是 7 个用例既没跑也没红，还被当成"通过"写进文档）。
+
+句子扩取的纯函数层另有 tests/test_extension_sentence.py 用 node 单测覆盖，
+manifest 的形状在 tests/test_extension_manifest.py（那个连 node 都不需要）。
 """
 
 from __future__ import annotations
@@ -154,6 +159,19 @@ def launch_with_extension(pw, user_data_dir: Path, ext_dir: Path):
     )
 
 
+def chromium_executable(pw) -> str:
+    """Playwright 认的 chromium 可执行文件路径（拿不到就返回空串）。"""
+    try:
+        return str(pw.chromium.executable_path or "")
+    except Exception:  # pragma: no cover - playwright 内部异常，当作"路径未知"
+        return ""
+
+
+INSTALL_HINT = (
+    "PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers playwright install chromium"
+)
+
+
 @pytest.fixture(scope="module")
 def pw():
     """整个模块共用一个 playwright 实例：sync API 不允许在自己的事件循环里再起一个。"""
@@ -165,22 +183,49 @@ def pw():
 
 
 @pytest.fixture(scope="module")
-def ctx(pw, workspace: dict, api_url: str, page_url: str):
-    """加载了插件的浏览器上下文；加载不起来就整模块 skip 并说明原因。"""
+def chromium_installed(pw) -> str:
+    """**本文件唯一允许 skip 的地方**：浏览器二进制压根不在（工单 17-6）。
+
+    只认"文件不存在"这一件事。存在却起不来 = 真问题，交给 ctx 去炸。
+    """
+    exe = chromium_executable(pw)
+    if not exe or not Path(exe).exists():
+        pytest.skip(
+            f"没装 Playwright chromium：{exe or '路径未知'} 不存在；"
+            f"跑 `{INSTALL_HINT}` 之后再来。"
+            "（这是本文件唯一允许的 skip 理由：浏览器在却起不来 / manifest 不合法 / "
+            "内容脚本没注入，一律算失败。）"
+        )
+    return exe
+
+
+@pytest.fixture(scope="module")
+def ctx(pw, chromium_installed: str, workspace: dict, api_url: str, page_url: str):
+    """加载了插件的浏览器上下文。到这一步就不许再 skip 了 —— 只许成功或失败。"""
     ext = make_ext(EXT_SRC, workspace["dir"] / "ext_live", api_url)
-    try:
-        context = launch_with_extension(pw, workspace["dir"] / "profile", ext)
-    except Exception as exc:  # pragma: no cover - 环境问题
-        pytest.skip(f"chromium 起不来（--load-extension）：{exc}")
+    # manifest 不合法是产品问题：先自己看一眼，炸得比浏览器的沉默更有信息量
+    manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest.get("manifest_version") == 3, f"manifest 不是 MV3: {manifest}"
+    bg = manifest.get("background") or {}
+    assert bg.get("service_worker") and bg.get("scripts"), (
+        f"background 少了 Chrome(service_worker) / Firefox(scripts) 中的一个键：{bg}"
+    )
+
+    # 浏览器**在**却起不来 = 失败，不是 skip（工单 17-6）
+    context = launch_with_extension(pw, workspace["dir"] / "profile", ext)
 
     probe = context.new_page()
     probe.goto(page_url)
     probe.dblclick("#w6")
-    try:  # 内容脚本没注进来 → 这个环境验不了，说明原因后整模块跳过
+    try:
         probe.wait_for_selector(".poi-flag", timeout=8000)
-    except Exception as exc:  # pragma: no cover - 环境问题
+    except Exception as exc:
         context.close()
-        pytest.skip(f"无头 chromium 没加载内容脚本（{type(exc).__name__}）：扩展 E2E 跳过")
+        raise AssertionError(
+            f"内容脚本没注入（{type(exc).__name__}）：选中 #w6 之后没等到 ⌖ 浮标。"
+            f"chromium 在 {chromium_installed}，扩展已随 --load-extension 加载 —— "
+            "这是扩展/注入本身的问题，不是环境问题，所以判失败而不是 skip（工单 17-6）。"
+        ) from exc
     probe.close()
 
     yield context
