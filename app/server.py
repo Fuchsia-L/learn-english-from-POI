@@ -366,7 +366,7 @@ class CollectIn(BaseModel):
 class CollectWebIn(BaseModel):
     """POST /collect/web：浏览器划词插件的收藏（工单 11）。
 
-    除 surface 外全可空 —— 插件在再吊钻的页面上也能退化成"光收词"，
+    除 surface 外全可空 —— 插件在再刁钻的页面上也能退化成"光收词"，
     不因为句子没截到 / 页面没标题就收藏失败。
     """
 
