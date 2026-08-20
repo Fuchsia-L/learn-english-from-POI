@@ -210,13 +210,46 @@ def tokens_to_json(tokens: Sequence[Token]) -> str:
 # --- 入库 ------------------------------------------------------------------
 
 
+class ContentExists(Exception):
+    """(title, season_ep) 已经在库里，且调用方要求「只新增、不覆盖」（工单 17-2）。
+
+    只有 create_only=True 的调用会遇到它 —— CLI 的 `python -m app.ingest` 照旧
+    幂等覆盖（重跑一集是日常操作），而 POST /import 走 create_only：那条链路后面
+    跟着一整个 uuid 媒体目录，静默覆盖等于把上一次导入的媒体变成孤儿。
+    """
+
+    def __init__(self, title: str, season_ep: str) -> None:
+        super().__init__(f"《{title}》{season_ep} 已经在库里了")
+        self.title = title
+        self.season_ep = season_ep
+
+
 def upsert_content(
     conn: sqlite3.Connection,
     title: str,
     season_ep: str,
     video_path: str | None,
     srt_path: str | None,
+    create_only: bool = False,
 ) -> int:
+    """写 Content 行，返回 content_id。
+
+    默认幂等 upsert（同一集重复 ingest 只更新路径）。`create_only=True` 时改成
+    **裸 INSERT**：撞上 UNIQUE (title, season_ep) 就抛 ContentExists，不覆盖。
+    先 SELECT 再判断挡不住并发 —— 两个线程可以同时看到「不存在」然后一起进来；
+    真正的仲裁只能交给唯一索引本身，这也是「原子」在这里的确切含义。
+    """
+    if create_only:
+        try:
+            cur = conn.execute(
+                "INSERT INTO Content (title, season_ep, video_path, srt_path) "
+                "VALUES (?,?,?,?)",
+                (title, season_ep, video_path, srt_path),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ContentExists(title, season_ep) from exc
+        return int(cur.lastrowid)
+
     conn.execute(
         "INSERT INTO Content (title, season_ep, video_path, srt_path) VALUES (?,?,?,?) "
         "ON CONFLICT (title, season_ep) DO UPDATE SET "
@@ -413,10 +446,13 @@ def ingest_srt(
     video_path: str | None = None,
     conn: sqlite3.Connection | None = None,
     boxes_path: str | Path | None = None,
+    create_only: bool = False,
 ) -> dict:
     """入口：解析 srt 并写库，返回统计 dict。
 
     给了 boxes_path 就在同一事务里回填词框（见 apply_boxes）。
+    create_only=True 时这一集必须是新的，撞上已有的 (title, season_ep) 抛
+    ContentExists（整个事务回滚，库里不留半条）——见 upsert_content。
     """
     cues = parse_srt_file(srt_path)
     entries = load_boxes(boxes_path) if boxes_path else None
@@ -425,7 +461,7 @@ def ingest_srt(
     try:
         with conn:
             content_id = upsert_content(
-                conn, title, season_ep, video_path, str(srt_path)
+                conn, title, season_ep, video_path, str(srt_path), create_only
             )
             stats = ingest_cues(conn, content_id, cues)
             if entries is not None:
