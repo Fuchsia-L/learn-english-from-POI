@@ -1446,9 +1446,12 @@ var R = {
 };
 
 function reviewRules(){
+  /* 口径以接口吐出来的 rules 为准（改常量不用改前端）；下面只是接口还没回来时
+     的兜底。间隔表比毕业档少一格是正常的：答对最后一次直接毕业，没有下一次
+     到期日（工单 17-5）。 */
   var r = R.rules || {};
-  var iv = (r.intervals && r.intervals.length) ? r.intervals : [1, 3, 7];
-  var grad = r.graduate_stage || iv.length;
+  var iv = (r.intervals && r.intervals.length) ? r.intervals : [1, 3];
+  var grad = r.graduate_stage || (iv.length + 1);
   return { intervals: iv, graduate: grad };
 }
 function reviewRuleText(){
